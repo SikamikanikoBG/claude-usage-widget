@@ -32,6 +32,12 @@ struct ClaudeAiOauth {
 struct UsageResponse {
     five_hour: LimitWindow,
     seven_day: LimitWindow,
+    // Deserialized as a loose `Value` (rather than `Option<ExtraUsage>`
+    // directly) so that *any* shape change or removal of this field by
+    // Anthropic -- not just its outright absence -- can never break parsing
+    // of `five_hour`/`seven_day` above. See `parse_extra_usage`.
+    #[serde(default)]
+    extra_usage: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -44,6 +50,84 @@ struct LimitWindow {
     resets_at: String,
 }
 
+/// The optional extra-usage/credit-balance block. `monthly_limit` and
+/// `used_credits` are conceptually integer minor units (e.g. cents); divide
+/// by `10^decimal_places` to get a display value. Like `LimitWindow::
+/// utilization` elsewhere in this file, the live endpoint sends these as
+/// JSON floats (e.g. `0.0`) even for whole numbers, so they're parsed as
+/// f64 rather than risking a deserialize failure on a non-integer value.
+///
+/// Every field defaults so that a partially-shaped (rather than fully
+/// missing) `extra_usage` object still parses instead of failing outright.
+#[derive(Deserialize, Clone)]
+struct ExtraUsage {
+    #[serde(default)]
+    is_enabled: bool,
+    #[serde(default)]
+    monthly_limit: f64,
+    #[serde(default)]
+    used_credits: f64,
+    #[serde(default)]
+    currency: String,
+    #[serde(default)]
+    decimal_places: u32,
+}
+
+/// Display-ready extra usage/credit balance info. Only produced when the
+/// account has extra usage enabled and the response was parseable.
+#[derive(Clone)]
+pub struct ExtraUsageInfo {
+    pub pct: u32,
+    pub used: f64,
+    pub limit: f64,
+    pub currency: String,
+}
+
+/// One data point (percentage + human-readable reset label) for a single
+/// usage window, used by the threshold-notification logic in `main.rs`.
+pub struct WindowUsage {
+    pub pct: u32,
+    pub resets_label: String,
+}
+
+/// Leniently converts the raw `extra_usage` JSON (if any) into display-ready
+/// info. Never propagates a parse error to the caller -- an unparseable or
+/// disabled block just means "don't show this line", not "usage data is
+/// broken".
+fn parse_extra_usage(value: &Option<serde_json::Value>) -> Option<ExtraUsageInfo> {
+    let value = value.clone()?;
+    let extra: ExtraUsage = match serde_json::from_value(value) {
+        Ok(extra) => extra,
+        Err(e) => {
+            eprintln!("[claude-usage-widget] ignoring unparseable extra_usage field: {e}");
+            return None;
+        }
+    };
+
+    if !extra.is_enabled {
+        return None;
+    }
+
+    // Defensive clamp: a garbage decimal_places value shouldn't be able to
+    // blow up the power-of-ten scale below.
+    let decimal_places = extra.decimal_places.min(10);
+    let scale = 10f64.powi(decimal_places as i32);
+    let used = extra.used_credits / scale;
+    let limit = extra.monthly_limit / scale;
+    let pct = if limit > 0.0 {
+        ((used / limit) * 100.0).round().clamp(0.0, 100.0) as u32
+    } else {
+        0
+    };
+
+    Some(ExtraUsageInfo {
+        pct,
+        used,
+        limit,
+        currency: extra.currency,
+    })
+}
+
 /// The state driving the tray icon, tooltip and menu text.
 #[derive(Clone)]
 pub enum TrayState {
@@ -52,6 +136,7 @@ pub enum TrayState {
         five_hour_resets: DateTime<Utc>,
         seven_day_pct: u32,
         seven_day_resets: DateTime<Utc>,
+        extra_usage: Option<ExtraUsageInfo>,
     },
     /// Data could not be obtained; carries a short human-readable reason
     /// (logged to stderr, not shown verbatim in the UI).
@@ -72,6 +157,53 @@ impl TrayState {
         }
     }
 
+    /// (`five_hour`, `seven_day`) usage, when available. Used by the
+    /// threshold-notification logic in `main.rs`.
+    pub fn windows(&self) -> Option<(WindowUsage, WindowUsage)> {
+        match self {
+            TrayState::Ok {
+                five_hour_pct,
+                five_hour_resets,
+                seven_day_pct,
+                seven_day_resets,
+                ..
+            } => {
+                let now = Utc::now();
+                Some((
+                    WindowUsage {
+                        pct: *five_hour_pct,
+                        resets_label: format_relative(*five_hour_resets, now),
+                    },
+                    WindowUsage {
+                        pct: *seven_day_pct,
+                        resets_label: format_weekday_time(*seven_day_resets),
+                    },
+                ))
+            }
+            TrayState::Unavailable(_) => None,
+        }
+    }
+
+    /// Text for the third, informational "extra usage / credit balance"
+    /// menu line. `None` when unavailable or (the common case) not enabled
+    /// on this account -- the caller should not show a menu line at all then.
+    pub fn extra_usage_line(&self, bar_width: usize) -> Option<String> {
+        match self {
+            TrayState::Ok {
+                extra_usage: Some(extra),
+                ..
+            } => Some(format!(
+                "Extra usage  [{}] {}%  {:.2}/{:.2} {}",
+                bar(extra.pct, bar_width),
+                extra.pct,
+                extra.used,
+                extra.limit,
+                extra.currency
+            )),
+            _ => None,
+        }
+    }
+
     /// Short (~2 line) tooltip shown on hover.
     pub fn tooltip(&self) -> String {
         match self {
@@ -81,6 +213,7 @@ impl TrayState {
                 five_hour_resets,
                 seven_day_pct,
                 seven_day_resets,
+                ..
             } => {
                 let now = Utc::now();
                 format!(
@@ -106,6 +239,7 @@ impl TrayState {
                 five_hour_resets,
                 seven_day_pct,
                 seven_day_resets,
+                ..
             } => {
                 let now = Utc::now();
                 let session = format!(
@@ -157,11 +291,13 @@ pub fn fetch_state(client: &reqwest::blocking::Client) -> TrayState {
 fn to_state(response: UsageResponse) -> Option<TrayState> {
     let five_hour_resets = parse_reset(&response.five_hour.resets_at)?;
     let seven_day_resets = parse_reset(&response.seven_day.resets_at)?;
+    let extra_usage = parse_extra_usage(&response.extra_usage);
     Some(TrayState::Ok {
         five_hour_pct: to_percent(response.five_hour.utilization),
         five_hour_resets,
         seven_day_pct: to_percent(response.seven_day.utilization),
         seven_day_resets,
+        extra_usage,
     })
 }
 
