@@ -1,0 +1,14 @@
+/target
+
+# Editor/OS cruft
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Local run artifacts (e.g. redirected stdout/stderr logs from manual testing)
+*.log
+
+# Note: Cargo.lock IS committed on purpose - this is a binary, not a library,
+# so the lockfile should be checked in for reproducible builds.

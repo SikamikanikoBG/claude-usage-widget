@@ -1,0 +1,13 @@
+[package]
+name = "claude-usage-widget"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4.45"
+reqwest = { version = "0.13.4", features = ["blocking", "json"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tao = "0.35.3"
+tray-icon = "0.24.1"
+winreg = "0.56.0"
