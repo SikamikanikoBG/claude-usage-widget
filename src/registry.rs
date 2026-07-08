@@ -20,6 +20,21 @@ const NOTIFY_ICON_SETTINGS_PATH: &str = r"Control Panel\NotifyIconSettings";
 const PROMOTE_MAX_ATTEMPTS: u32 = 10;
 const PROMOTE_RETRY_DELAY: Duration = Duration::from_millis(200);
 
+// Our own settings key -- distinct from the two Windows-owned keys above --
+// for the floating usage panel's persisted visibility/mode (see `panel.rs`)
+// and the configurable poll interval below.
+const APP_SETTINGS_KEY_PATH: &str = r"Software\ClaudeUsageWidget";
+const PANEL_VISIBLE_VALUE: &str = "PanelVisible";
+const PANEL_MODE_VALUE: &str = "PanelMode";
+const POLL_INTERVAL_VALUE: &str = "PollIntervalSecs";
+
+/// Hard floor for the poll interval: "no need to spam Anthropic" was an
+/// explicit requirement, not just a sensible default, so this is enforced
+/// here (not just in the menu's list of offered choices) in case the
+/// registry value is ever edited by hand or by an older/newer version.
+pub const MIN_POLL_INTERVAL_SECS: u32 = 60;
+const DEFAULT_POLL_INTERVAL_SECS: u32 = 60;
+
 /// Returns the quoted path to the currently running executable, used both to
 /// populate the registry and to check whether an existing entry matches us.
 fn current_exe_value() -> std::io::Result<String> {
@@ -62,6 +77,64 @@ pub fn set_startup_enabled(enable: bool) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether the floating usage panel (`panel.rs`) should be shown, per the
+/// last choice made from the tray menu. Defaults to `false` (off) when the
+/// value has never been set -- first run should not pop up a window the
+/// user didn't ask for.
+pub fn is_panel_visible() -> bool {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    hkcu.open_subkey_with_flags(APP_SETTINGS_KEY_PATH, KEY_READ)
+        .and_then(|key| key.get_value::<u32, _>(PANEL_VISIBLE_VALUE))
+        .map(|v| v != 0)
+        .unwrap_or(false)
+}
+
+/// Persists the floating usage panel's shown/hidden state.
+pub fn set_panel_visible(visible: bool) -> std::io::Result<()> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _disposition) = hkcu.create_subkey(APP_SETTINGS_KEY_PATH)?;
+    key.set_value(PANEL_VISIBLE_VALUE, &(visible as u32))
+}
+
+/// The raw persisted panel display-mode string (see
+/// `panel::PanelMode::{as_registry_str, from_registry_str}`), or `None` if
+/// never set (caller should default to "both").
+pub fn panel_mode_str() -> Option<String> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    hkcu.open_subkey_with_flags(APP_SETTINGS_KEY_PATH, KEY_READ)
+        .and_then(|key| key.get_value::<String, _>(PANEL_MODE_VALUE))
+        .ok()
+}
+
+/// Persists the floating usage panel's selected display mode.
+pub fn set_panel_mode_str(mode: &str) -> std::io::Result<()> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _disposition) = hkcu.create_subkey(APP_SETTINGS_KEY_PATH)?;
+    key.set_value(PANEL_MODE_VALUE, &mode.to_string())
+}
+
+/// The poll interval in seconds, clamped to [`MIN_POLL_INTERVAL_SECS`] no
+/// matter what's stored (defends against a hand-edited or stale-version
+/// registry value below the floor), defaulting to
+/// `DEFAULT_POLL_INTERVAL_SECS` when never set.
+pub fn poll_interval_secs() -> u64 {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let raw = hkcu
+        .open_subkey_with_flags(APP_SETTINGS_KEY_PATH, KEY_READ)
+        .and_then(|key| key.get_value::<u32, _>(POLL_INTERVAL_VALUE))
+        .unwrap_or(DEFAULT_POLL_INTERVAL_SECS);
+    raw.max(MIN_POLL_INTERVAL_SECS) as u64
+}
+
+/// Persists the poll interval, clamping below to [`MIN_POLL_INTERVAL_SECS`]
+/// regardless of what the caller asks for.
+pub fn set_poll_interval_secs(secs: u64) -> std::io::Result<()> {
+    let secs = (secs.min(u32::MAX as u64) as u32).max(MIN_POLL_INTERVAL_SECS);
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _disposition) = hkcu.create_subkey(APP_SETTINGS_KEY_PATH)?;
+    key.set_value(POLL_INTERVAL_VALUE, &secs)
 }
 
 /// Outcome of a single attempt to find and promote this exe's

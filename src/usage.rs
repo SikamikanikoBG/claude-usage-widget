@@ -13,8 +13,59 @@ use serde::Deserialize;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const ANTHROPIC_BETA: &str = "oauth-2025-04-20";
-const UNAVAILABLE_TOOLTIP: &str =
-    "Claude usage: sign-in token expired or unavailable\nRun `claude` once to refresh, then this will update.";
+
+/// Why a fetch attempt failed, used to show an accurate message instead of a
+/// single generic "unavailable" string. This matters in practice: the
+/// original generic message ("sign-in token expired... run `claude` to
+/// refresh") is actively misleading when the real cause is rate-limiting --
+/// a user seeing that message during a 429 backoff has no reason to think
+/// their session is fine and it'll clear on its own, so they go re-authenticate
+/// for no reason (confirmed as a real point of confusion, not hypothetical).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UnavailableReason {
+    /// The credentials file is missing/unparseable/empty, or the server
+    /// itself told us the token is bad (401/403). Actually worth telling the
+    /// user to re-run `claude`.
+    TokenProblem,
+    /// HTTP 429 from the usage endpoint. Transient by nature -- the worker
+    /// loop in `main.rs` is already backing off and will recover on its own.
+    RateLimited,
+    /// The request itself couldn't be sent/completed (DNS, offline, timeout).
+    NetworkError,
+    /// Anything else (unexpected HTTP status, unparseable response body/
+    /// timestamp). Also expected to be transient.
+    Other,
+}
+
+impl UnavailableReason {
+    /// Short tooltip/menu-line text for this reason. Every variant other
+    /// than `TokenProblem` explicitly says "retrying automatically" so it's
+    /// clear no user action is needed.
+    fn label(self) -> &'static str {
+        match self {
+            UnavailableReason::TokenProblem => {
+                "sign-in token expired or unavailable\nRun `claude` once to refresh, then this will update."
+            }
+            UnavailableReason::RateLimited => {
+                "rate-limited by Anthropic right now\nThis clears on its own -- retrying automatically."
+            }
+            UnavailableReason::NetworkError => {
+                "network error reaching Anthropic\nRetrying automatically."
+            }
+            UnavailableReason::Other => "temporarily unavailable\nRetrying automatically.",
+        }
+    }
+
+    /// Very short (fits a single menu line) version of `label`.
+    fn short_label(self) -> &'static str {
+        match self {
+            UnavailableReason::TokenProblem => "sign-in needed",
+            UnavailableReason::RateLimited => "rate-limited, retrying",
+            UnavailableReason::NetworkError => "network error, retrying",
+            UnavailableReason::Other => "unavailable, retrying",
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct CredentialsFile {
@@ -138,9 +189,13 @@ pub enum TrayState {
         seven_day_resets: DateTime<Utc>,
         extra_usage: Option<ExtraUsageInfo>,
     },
-    /// Data could not be obtained; carries a short human-readable reason
-    /// (logged to stderr, not shown verbatim in the UI).
-    Unavailable(#[allow(dead_code)] String),
+    /// Data could not be obtained. `detail` is logged to stderr (not shown
+    /// verbatim in the UI); `reason` drives what the UI actually says.
+    Unavailable {
+        #[allow(dead_code)]
+        detail: String,
+        reason: UnavailableReason,
+    },
 }
 
 impl TrayState {
@@ -153,7 +208,7 @@ impl TrayState {
                 seven_day_pct,
                 ..
             } => Some((*five_hour_pct).max(*seven_day_pct)),
-            TrayState::Unavailable(_) => None,
+            TrayState::Unavailable { .. } => None,
         }
     }
 
@@ -180,7 +235,17 @@ impl TrayState {
                     },
                 ))
             }
-            TrayState::Unavailable(_) => None,
+            TrayState::Unavailable { .. } => None,
+        }
+    }
+
+    /// Short label describing why data is unavailable, when it is. Used by
+    /// the floating usage panel (`panel.rs`) so it shows the same accurate
+    /// reason as the tray tooltip/menu instead of a generic message.
+    pub fn unavailable_short_label(&self) -> Option<&'static str> {
+        match self {
+            TrayState::Unavailable { reason, .. } => Some(reason.short_label()),
+            TrayState::Ok { .. } => None,
         }
     }
 
@@ -207,7 +272,7 @@ impl TrayState {
     /// Short (~2 line) tooltip shown on hover.
     pub fn tooltip(&self) -> String {
         match self {
-            TrayState::Unavailable(_) => UNAVAILABLE_TOOLTIP.to_string(),
+            TrayState::Unavailable { reason, .. } => format!("Claude usage: {}", reason.label()),
             TrayState::Ok {
                 five_hour_pct,
                 five_hour_resets,
@@ -230,9 +295,9 @@ impl TrayState {
     /// Text for the two disabled "at a glance" menu entries: (session, weekly).
     pub fn menu_lines(&self, bar_width: usize) -> (String, String) {
         match self {
-            TrayState::Unavailable(_) => (
-                "Session  unavailable".to_string(),
-                "Weekly   unavailable".to_string(),
+            TrayState::Unavailable { reason, .. } => (
+                format!("Session  {}", reason.short_label()),
+                format!("Weekly   {}", reason.short_label()),
             ),
             TrayState::Ok {
                 five_hour_pct,
@@ -260,30 +325,81 @@ impl TrayState {
     }
 }
 
+/// Result of one [`fetch_state`] call: the state to show, plus (only set
+/// when the last HTTP attempt failed with 429 and sent a parseable
+/// `Retry-After` header) how long the server asked us to wait before trying
+/// again. The polling/backoff loop in `main.rs` is the only consumer of the
+/// latter.
+pub struct FetchOutcome {
+    pub state: TrayState,
+    pub retry_after_secs: Option<u64>,
+}
+
+/// Internal fetch error, carrying the category the UI should show plus an
+/// optional `Retry-After` hint alongside the usual human-readable message.
+struct FetchError {
+    message: String,
+    reason: UnavailableReason,
+    retry_after_secs: Option<u64>,
+}
+
+impl From<String> for FetchError {
+    /// Used for errors that don't have a more specific category (e.g. an
+    /// unparseable response body) -- defaults to `Other`.
+    fn from(message: String) -> Self {
+        FetchError {
+            message,
+            reason: UnavailableReason::Other,
+            retry_after_secs: None,
+        }
+    }
+}
+
 /// Reads the cached token and fetches current usage, collapsing every
 /// failure mode into `TrayState::Unavailable` so the caller never has to
 /// handle an error (and the app never crashes on a bad response).
-pub fn fetch_state(client: &reqwest::blocking::Client) -> TrayState {
+pub fn fetch_state(client: &reqwest::blocking::Client) -> FetchOutcome {
     let token = match read_access_token() {
         Ok(token) => token,
-        Err(reason) => {
-            eprintln!("[claude-usage-widget] {reason}");
-            return TrayState::Unavailable(reason);
+        Err(detail) => {
+            eprintln!("[claude-usage-widget] {detail}");
+            return FetchOutcome {
+                state: TrayState::Unavailable {
+                    detail,
+                    reason: UnavailableReason::TokenProblem,
+                },
+                retry_after_secs: None,
+            };
         }
     };
 
     match fetch_usage(client, &token) {
         Ok(response) => match to_state(response) {
-            Some(state) => state,
+            Some(state) => FetchOutcome {
+                state,
+                retry_after_secs: None,
+            },
             None => {
-                let reason = "usage response had an unparseable reset timestamp".to_string();
-                eprintln!("[claude-usage-widget] {reason}");
-                TrayState::Unavailable(reason)
+                let detail = "usage response had an unparseable reset timestamp".to_string();
+                eprintln!("[claude-usage-widget] {detail}");
+                FetchOutcome {
+                    state: TrayState::Unavailable {
+                        detail,
+                        reason: UnavailableReason::Other,
+                    },
+                    retry_after_secs: None,
+                }
             }
         },
-        Err(reason) => {
-            eprintln!("[claude-usage-widget] {reason}");
-            TrayState::Unavailable(reason)
+        Err(e) => {
+            eprintln!("[claude-usage-widget] {}", e.message);
+            FetchOutcome {
+                state: TrayState::Unavailable {
+                    detail: e.message,
+                    reason: e.reason,
+                },
+                retry_after_secs: e.retry_after_secs,
+            }
         }
     }
 }
@@ -332,23 +448,62 @@ fn read_access_token() -> Result<String, String> {
     Ok(token)
 }
 
-fn fetch_usage(client: &reqwest::blocking::Client, token: &str) -> Result<UsageResponse, String> {
+fn fetch_usage(
+    client: &reqwest::blocking::Client,
+    token: &str,
+) -> Result<UsageResponse, FetchError> {
     let response = client
         .get(USAGE_URL)
         .header("Authorization", format!("Bearer {token}"))
         .header("anthropic-beta", ANTHROPIC_BETA)
         .header("Content-Type", "application/json")
         .send()
-        .map_err(|e| format!("network error calling usage endpoint: {e}"))?;
+        .map_err(|e| FetchError {
+            message: format!("network error calling usage endpoint: {e}"),
+            reason: UnavailableReason::NetworkError,
+            retry_after_secs: None,
+        })?;
 
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("usage endpoint returned HTTP {status}"));
+        // This undocumented endpoint has been observed rate-limiting overly
+        // frequent polling with HTTP 429; when it does, respect any
+        // `Retry-After` hint it sends rather than guessing purely from our
+        // own backoff schedule. 401/403 genuinely mean the token itself is
+        // bad, which -- unlike a 429 -- really does need the user to
+        // re-authenticate, so it's categorized separately.
+        let code = status.as_u16();
+        let (reason, retry_after_secs) = match code {
+            429 => (UnavailableReason::RateLimited, parse_retry_after(&response)),
+            401 | 403 => (UnavailableReason::TokenProblem, None),
+            _ => (UnavailableReason::Other, None),
+        };
+        return Err(FetchError {
+            message: format!("usage endpoint returned HTTP {status}"),
+            reason,
+            retry_after_secs,
+        });
     }
 
     response
         .json::<UsageResponse>()
-        .map_err(|e| format!("could not parse usage endpoint response: {e}"))
+        .map_err(|e| format!("could not parse usage endpoint response: {e}").into())
+}
+
+/// Simple integer-seconds parsing of the `Retry-After` header -- the only
+/// form this endpoint is expected to send, if it sends one at all.
+/// Deliberately does not attempt full HTTP-date parsing for the rarer
+/// `Retry-After: <date>` form; callers fall back to the computed exponential
+/// backoff instead when this returns `None`.
+fn parse_retry_after(response: &reqwest::blocking::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
 }
 
 /// "3h40m" / "40m" / "now" style duration until `reset` as seen from `now`.
