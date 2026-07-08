@@ -43,10 +43,23 @@ use usage::TrayState;
 const POLL_INTERVAL_PRESETS_SECS: [(u64, &str); 4] =
     [(60, "1 minute"), (120, "2 minutes"), (300, "5 minutes"), (600, "10 minutes")];
 
-/// Ceiling for the exponential backoff below: even after a long streak of
-/// consecutive failures (429s, network errors, etc.), never wait longer
-/// than this between polling attempts.
+/// Ceiling for the RATE-LIMITED backoff schedule: even after a long streak
+/// of consecutive 429s, never wait longer than this between attempts.
 const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
+
+/// Base and ceiling for the CONNECTIVITY backoff schedule (network errors,
+/// unparseable responses, token problems -- anything that isn't a 429).
+/// Live evidence: after the machine sat idle for a few hours, a handful of
+/// requests failed with connection/decode errors (stale keep-alive
+/// connections after sleep/wake is the leading theory) and self-healed
+/// within a few attempts -- but at the rate-limit backoff's schedule, each
+/// of those attempts was minutes apart, making a hiccup that actually
+/// resolves in seconds look like the widget being broken for a long
+/// stretch. These aren't rate-limit signals, so they get a much faster,
+/// separate retry schedule instead of borrowing the cautious one meant for
+/// 429s.
+const CONNECTIVITY_BACKOFF_BASE: Duration = Duration::from_secs(5);
+const CONNECTIVITY_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 const BAR_WIDTH: usize = 10;
 
@@ -465,10 +478,13 @@ fn spawn_worker(proxy: EventLoopProxy<UserEvent>, poll_interval_secs: Arc<Atomic
     let (tx, rx) = mpsc::channel::<()>();
 
     thread::spawn(move || {
-        let client = match reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-        {
+        fn build_client() -> reqwest::Result<reqwest::blocking::Client> {
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+        }
+
+        let mut client = match build_client() {
             Ok(client) => client,
             Err(e) => {
                 eprintln!("[claude-usage-widget] failed to build HTTP client: {e}");
@@ -496,6 +512,7 @@ fn spawn_worker(proxy: EventLoopProxy<UserEvent>, poll_interval_secs: Arc<Atomic
 
             let outcome = usage::fetch_state(&client);
             let succeeded = matches!(outcome.state, TrayState::Ok { .. });
+            let unavailable_reason = outcome.state.unavailable_reason();
 
             // Logged on every attempt, success included: a silent-on-success
             // design once made a real production bug (the GUI thread wedging
@@ -533,15 +550,56 @@ fn spawn_worker(proxy: EventLoopProxy<UserEvent>, poll_interval_secs: Arc<Atomic
                 base_interval
             } else {
                 consecutive_failures = consecutive_failures.saturating_add(1);
-                let wait = effective_wait(
-                    consecutive_failures,
-                    base_interval,
-                    MAX_BACKOFF,
-                    outcome.retry_after_secs,
-                );
+
+                // Only an actual 429 gets the long, cautious rate-limit
+                // backoff. Everything else (network errors, unparseable
+                // responses, token problems) is far more likely to be a
+                // short-lived hiccup -- e.g. stale connections after the
+                // machine sleeps/wakes -- and gets a much faster schedule so
+                // it doesn't look like the widget is broken for minutes at a
+                // time over something that resolves itself in seconds.
+                let is_rate_limited =
+                    unavailable_reason == Some(usage::UnavailableReason::RateLimited);
+                let wait = if is_rate_limited {
+                    effective_wait(
+                        consecutive_failures,
+                        base_interval,
+                        MAX_BACKOFF,
+                        outcome.retry_after_secs,
+                    )
+                } else {
+                    effective_wait(
+                        consecutive_failures,
+                        CONNECTIVITY_BACKOFF_BASE,
+                        CONNECTIVITY_MAX_BACKOFF,
+                        None,
+                    )
+                };
+
+                // A network-transport-level failure (as opposed to a bad
+                // HTTP status) is the one case where the client itself might
+                // be the problem -- e.g. reusing a keep-alive connection
+                // that went stale across a sleep/wake cycle. Rebuilding it
+                // is cheap and means the next attempt isn't handicapped by
+                // whatever connection caused this failure.
+                if unavailable_reason == Some(usage::UnavailableReason::NetworkError) {
+                    match build_client() {
+                        Ok(fresh) => {
+                            client = fresh;
+                            eprintln!(
+                                "[claude-usage-widget] rebuilt HTTP client after a network error"
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("[claude-usage-widget] could not rebuild HTTP client: {e}");
+                        }
+                    }
+                }
+
                 eprintln!(
-                    "[claude-usage-widget] entering backoff for {}s (consecutive failure #{consecutive_failures})",
-                    wait.as_secs()
+                    "[claude-usage-widget] entering backoff for {}s (consecutive failure #{consecutive_failures}, {})",
+                    wait.as_secs(),
+                    if is_rate_limited { "rate-limited" } else { "connectivity" }
                 );
                 wait
             };

@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.3]
+
+### Fixed
+
+- Connectivity hiccups (network errors, unparseable responses, token
+  problems) no longer use the same long, cautious backoff schedule as an
+  actual HTTP 429. Live evidence: after the machine sat idle for a few
+  hours, a handful of requests failed with connection/decode errors (stale
+  keep-alive connections surviving a sleep/wake cycle is the leading
+  theory) and self-healed within a few attempts -- but at the rate-limit
+  schedule's pace, each retry was minutes apart, making a hiccup that
+  actually resolves in seconds look like the widget being broken for a
+  long stretch. Only a real 429 gets the cautious 5-minute-based backoff
+  now; everything else gets a fast 5s-to-60s schedule. The HTTP client is
+  also rebuilt after a network-transport-level failure specifically,
+  rather than continuing to reuse a connection that might be the actual
+  cause.
+
 ## [0.3.2]
 
 ### Fixed

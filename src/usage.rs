@@ -199,6 +199,19 @@ pub enum TrayState {
 }
 
 impl TrayState {
+    /// The failure category, when this is an `Unavailable` state. Used by
+    /// the polling loop in `main.rs` to pick a backoff schedule: only
+    /// `RateLimited` warrants the long, cautious exponential backoff --
+    /// transient connectivity blips (e.g. stale connections after the
+    /// machine sleeps/wakes) recover far faster and shouldn't make the user
+    /// wait minutes to find out.
+    pub fn unavailable_reason(&self) -> Option<UnavailableReason> {
+        match self {
+            TrayState::Unavailable { reason, .. } => Some(*reason),
+            TrayState::Ok { .. } => None,
+        }
+    }
+
     /// Highest of the two utilization percentages, used to pick the tray
     /// icon color. `None` when data is unavailable (renders gray).
     pub fn max_utilization(&self) -> Option<u32> {

@@ -169,11 +169,17 @@ check "Start with Windows".
   at your configured interval (1-10 minutes, 5-minute default, 1-minute
   floor), re-reading the credentials file on every attempt so it picks up a
   refreshed token without needing a restart.
-- On failure, it backs off exponentially (doubling from the poll interval, up
-  to a 5-minute cap) rather than retrying at a fixed rate, and respects a
-  server-sent `Retry-After` header when there's a sane one to respect - this
-  is what makes the "rate-limited, retrying" state self-heal instead of
-  turning a temporary 429 into a retry storm.
+- On failure, it backs off - but on two different schedules depending on
+  what went wrong. An actual HTTP 429 gets a cautious exponential backoff
+  (doubling from the poll interval, up to a 5-minute cap) and respects a
+  server-sent `Retry-After` header when there's a sane one to respect, so a
+  real rate-limit situation self-heals instead of turning into a retry
+  storm. Anything else - a network error, an unparseable response, a token
+  problem - gets a much faster 5s-to-60s schedule instead, since those are
+  usually short-lived hiccups (a stale connection after the machine
+  sleeps/wakes, for example) that don't need minutes to recover from. A
+  network-transport-level failure specifically also rebuilds the HTTP
+  client before the next attempt, in case the connection itself was stale.
 - A named Win32 mutex (`Global\ClaudeUsageWidget_SingleInstance`) guards
   against two copies running at once; a second launch detects the existing
   mutex and exits immediately, before creating any UI.
