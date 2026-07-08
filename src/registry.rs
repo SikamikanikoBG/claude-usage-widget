@@ -33,7 +33,16 @@ const POLL_INTERVAL_VALUE: &str = "PollIntervalSecs";
 /// here (not just in the menu's list of offered choices) in case the
 /// registry value is ever edited by hand or by an older/newer version.
 pub const MIN_POLL_INTERVAL_SECS: u32 = 60;
-const DEFAULT_POLL_INTERVAL_SECS: u32 = 60;
+
+/// Default for a fresh install (no registry value yet). Raised from the
+/// original 60s: live evidence on 2026-07-08 showed HTTP 429 recurring
+/// frequently even from pure 60s solo polling with zero manual refreshes or
+/// hover interaction involved -- this undocumented endpoint's real-world
+/// rate limit, especially after a day of heavy testing against the same
+/// account, is evidently stricter than "once a minute" in practice. 5
+/// minutes is a meaningfully safer out-of-the-box default; 1 minute is still
+/// selectable from the "Poll interval" menu for anyone who wants it.
+const DEFAULT_POLL_INTERVAL_SECS: u32 = 300;
 
 /// Returns the quoted path to the currently running executable, used both to
 /// populate the registry and to check whether an existing entry matches us.

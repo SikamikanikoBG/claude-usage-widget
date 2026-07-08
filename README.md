@@ -77,8 +77,11 @@ with real progress bars if you want more than a glance.
   **Weekly only**, or **Rotating** (alternates every 2 seconds). Your choice
   is remembered across restarts.
 - **Poll interval** (tray menu submenu): how often it checks, from **1
-  minute** (the default, and the floor - this app will never poll faster
-  than that, on purpose) up to **10 minutes**. Changing it applies
+  minute** (the floor - this app will never poll faster than that, on
+  purpose) up to **10 minutes**. Defaults to **5 minutes** - real-world
+  testing showed this undocumented endpoint's own rate limit is stricter
+  than "once a minute" in practice, so 1 minute is available if you want it,
+  but isn't what a fresh install uses out of the box. Changing it applies
   immediately, no restart needed.
 
 "Refresh now" forces an immediate re-check without waiting for the timer -
@@ -163,9 +166,9 @@ check "Start with Windows".
 ## How it works, briefly
 
 - A background thread polls `GET https://api.anthropic.com/api/oauth/usage`
-  at your configured interval (1-10 minutes, 1 minute floor and default),
-  re-reading the credentials file on every attempt so it picks up a refreshed
-  token without needing a restart.
+  at your configured interval (1-10 minutes, 5-minute default, 1-minute
+  floor), re-reading the credentials file on every attempt so it picks up a
+  refreshed token without needing a restart.
 - On failure, it backs off exponentially (doubling from the poll interval, up
   to a 5-minute cap) rather than retrying at a fixed rate, and respects a
   server-sent `Retry-After` header when there's a sane one to respect - this

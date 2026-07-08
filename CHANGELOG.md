@@ -4,6 +4,40 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.2]
+
+### Fixed
+
+- **0.3.1 has a real freeze bug -- upgrade past it.** In removing the
+  hover-refresh trigger (below), 0.3.1 also removed the
+  `TrayIconEvent::set_event_handler` registration entirely instead of
+  replacing it with a no-op. Live evidence: the widget logged one poll
+  cycle normally, then went completely silent for 30+ minutes with the
+  tray icon stuck on its last state, even though the usage endpoint was
+  confirmed reachable the whole time. The exact internal mechanism wasn't
+  fully pinned down (one specific theory -- the crate's internal fallback
+  event channel filling up and blocking the Windows message pump -- was
+  checked and ruled out, since that channel is unbounded and can't block),
+  but restoring the handler registration (now a genuine no-op rather than
+  forwarding events anywhere) is the exact plumbing that ran stable for
+  30+ minutes across 0.2.0 and 0.3.0, so that's what's restored here.
+- Added a one-line heartbeat log for every successful poll (previously
+  silent on success), so "is this actually still running" is never again
+  a guessing game from the log alone -- this silence is exactly what made
+  the 0.3.1 freeze hard to distinguish from healthy operation at first.
+- Default poll interval raised from 60s to 5 minutes. Live evidence on
+  2026-07-08 showed HTTP 429 recurring frequently even from pure passive
+  60s polling with zero manual refreshes or hover interaction involved --
+  this undocumented endpoint's real-world rate limit, especially after a
+  day of heavy testing against the same account, is evidently stricter
+  than "once a minute" in practice. 1 minute remains selectable from the
+  "Poll interval" menu (the floor is unchanged), just no longer the
+  out-of-the-box default.
+- Added menu-dispatch diagnostic logging (which panel mode was selected,
+  and a fallback log for any menu event that doesn't match a known item)
+  to make future "the UI doesn't seem to respond" reports diagnosable
+  without needing to reproduce live with a custom-instrumented build.
+
 ## [0.3.1]
 
 ### Fixed

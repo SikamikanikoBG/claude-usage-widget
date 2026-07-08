@@ -373,9 +373,12 @@ pub fn set_visible(hwnd: HWND, visible: bool) {
 /// Switches the panel's display mode, starting/stopping the rotate timer to
 /// match and resetting rotation back to the five-hour side.
 pub fn set_mode(hwnd: HWND, mode: PanelMode) {
+    eprintln!("[claude-usage-widget] panel: set_mode({mode:?}), hwnd_is_null={}", hwnd.is_null());
     if let Ok(mut s) = state().lock() {
         s.mode = mode;
         s.rotate_show_five_hour = true;
+    } else {
+        eprintln!("[claude-usage-widget] panel: set_mode could not lock state (poisoned mutex?)");
     }
     if !hwnd.is_null() {
         sync_timer(hwnd);

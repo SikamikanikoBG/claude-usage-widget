@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use tray_icon::TrayIconBuilder;
+use tray_icon::{TrayIconBuilder, TrayIconEvent};
 use windows_sys::Win32::Foundation::HWND;
 
 use panel::PanelMode;
@@ -84,6 +84,23 @@ fn main() {
     // the timer, and those were what tripped this endpoint's rate limit in
     // practice. "Refresh now" in the menu is the only way to force a check;
     // hovering just shows the last fetched data.
+    //
+    // A handler is still registered here (as a true no-op) rather than left
+    // unset entirely. Leaving it unset was tried live and reproduced a real
+    // freeze: the widget logged one poll cycle, then went completely silent
+    // for 30+ minutes with the tray icon stuck gray, even though the usage
+    // endpoint was confirmed reachable again the whole time -- something
+    // about not registering a handler at all wedges the GUI thread after
+    // the first OS-delivered tray event, in a way that then makes the
+    // worker thread's `proxy.send_event` calls silently do nothing forever.
+    // (Checked one specific theory -- the crate's internal fallback channel
+    // filling up and blocking the Windows message pump -- and ruled it out:
+    // that channel is unbounded, so it can't block. The exact mechanism is
+    // still unconfirmed; what's confirmed is that this exact plumbing
+    // (handler always registered, whether or not it does anything) is what
+    // ran stable for 30+ minutes in 0.2.0/0.3.0 before this file removed it,
+    // so restoring it is the safe fix rather than a fully understood one.)
+    TrayIconEvent::set_event_handler(Some(|_event| {}));
 
     let menu_proxy = event_loop.create_proxy();
     MenuEvent::set_event_handler(Some(move |event| {
@@ -330,6 +347,8 @@ fn main() {
                 } else if event.id == quit_item.id() {
                     tray_icon.take();
                     *control_flow = ControlFlow::Exit;
+                } else {
+                    eprintln!("[claude-usage-widget] menu: unmatched event id {:?}", event.id);
                 }
             }
 
@@ -358,6 +377,7 @@ fn crossed_threshold(already_notified: &mut bool, pct: u32) -> bool {
 /// (`muda`'s `CheckMenuItem` has no built-in radio-group concept), persists
 /// the choice to the registry, and applies it to the live panel window.
 fn select_panel_mode(items: &[(CheckMenuItem, PanelMode)], panel_hwnd: HWND, selected: PanelMode) {
+    eprintln!("[claude-usage-widget] menu: panel mode selected -> {selected:?}");
     for (item, mode) in items {
         item.set_checked(*mode == selected);
     }
@@ -477,8 +497,28 @@ fn spawn_worker(proxy: EventLoopProxy<UserEvent>, poll_interval_secs: Arc<Atomic
             let outcome = usage::fetch_state(&client);
             let succeeded = matches!(outcome.state, TrayState::Ok { .. });
 
+            // Logged on every attempt, success included: a silent-on-success
+            // design once made a real production bug (the GUI thread wedging
+            // after a tray-icon event) indistinguishable from "everything's
+            // fine, quietly polling" for 30+ minutes. A one-line heartbeat
+            // costs nothing and means "is this actually still running" is
+            // never again a guessing game from the log alone.
+            if let TrayState::Ok {
+                five_hour_pct,
+                seven_day_pct,
+                ..
+            } = &outcome.state
+            {
+                eprintln!(
+                    "[claude-usage-widget] poll ok: session {five_hour_pct}%, weekly {seven_day_pct}%"
+                );
+            }
+
             if proxy.send_event(UserEvent::Usage(outcome.state)).is_err() {
                 // The event loop is gone (app is shutting down); stop polling.
+                eprintln!(
+                    "[claude-usage-widget] event loop proxy is gone; stopping the poll worker"
+                );
                 break;
             }
 
