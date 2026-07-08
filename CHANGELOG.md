@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.1]
+
+### Fixed
+
+- Removed the tray icon hover/click auto-refresh added in 0.2.0. Live
+  evidence right after 0.3.0 shipped: the log showed a repeating
+  success -> immediate 429 -> 120s backoff -> success -> immediate 429
+  cycle, matching exactly "hover to check the icon a couple of times" -
+  each hover fired an extra request on top of the timer (the 3-second
+  debounce wasn't nearly enough headroom), and those extra requests were
+  what tripped this endpoint's rate limit. Hovering/clicking the icon no
+  longer triggers any network request; "Refresh now" in the menu is the
+  only way to force an immediate check, same as the timer-driven poll.
+
 ## [0.3.0]
 
 ### Added

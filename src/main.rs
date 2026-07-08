@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use tray_icon::{TrayIconBuilder, TrayIconEvent};
+use tray_icon::TrayIconBuilder;
 use windows_sys::Win32::Foundation::HWND;
 
 use panel::PanelMode;
@@ -54,19 +54,11 @@ const BAR_WIDTH: usize = 10;
 /// threshold notification fires.
 const NOTIFY_THRESHOLD: u32 = 90;
 
-/// Ignore repeat tray-icon-interaction refreshes within this long of the
-/// last one, so repeatedly hovering doesn't hammer the endpoint. Note this
-/// is purely a "don't spam pings into the channel" debounce; the actual
-/// decision of whether a ping is honored (e.g. suppressed during a backoff
-/// cooldown) lives solely in the worker loop in `spawn_worker`.
-const TRAY_REFRESH_DEBOUNCE: Duration = Duration::from_secs(3);
-
 /// Position (within `tray_menu`) the extra-usage line is inserted at when
 /// it's shown: right after the two core lines, before the separator.
 const EXTRA_USAGE_MENU_POSITION: usize = 2;
 
 enum UserEvent {
-    Tray(TrayIconEvent),
     Menu(MenuEvent),
     Usage(TrayState),
 }
@@ -85,10 +77,13 @@ fn main() {
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
 
-    let tray_proxy = event_loop.create_proxy();
-    TrayIconEvent::set_event_handler(Some(move |event| {
-        let _ = tray_proxy.send_event(UserEvent::Tray(event));
-    }));
+    // Tray icon hover/click events are deliberately NOT wired up to trigger
+    // anything: an earlier version used them to force an immediate refresh,
+    // which turned out to be the actual cause of a real production bug --
+    // casually hovering the icon a few times fires extra requests on top of
+    // the timer, and those were what tripped this endpoint's rate limit in
+    // practice. "Refresh now" in the menu is the only way to force a check;
+    // hovering just shows the last fetched data.
 
     let menu_proxy = event_loop.create_proxy();
     MenuEvent::set_event_handler(Some(move |event| {
@@ -217,9 +212,6 @@ fn main() {
     let mut notified_five_hour = false;
     let mut notified_seven_day = false;
 
-    // Debounce state for refreshes triggered by tray icon hover/click.
-    let mut last_tray_triggered_refresh: Option<Instant> = None;
-
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
@@ -299,31 +291,6 @@ fn main() {
                                 seven_day.pct, seven_day.resets_label
                             ),
                         );
-                    }
-                }
-            }
-
-            Event::UserEvent(UserEvent::Tray(event)) => {
-                // Refresh immediately on any real interaction (hover-enter
-                // or click) rather than waiting for the poll timer, so the
-                // numbers the user is about to look at aren't stale. Move
-                // events (continuous mouse movement while already hovering)
-                // and Leave are deliberately not treated as interactions.
-                let is_interaction = matches!(
-                    event,
-                    TrayIconEvent::Enter { .. }
-                        | TrayIconEvent::Click { .. }
-                        | TrayIconEvent::DoubleClick { .. }
-                );
-                if is_interaction {
-                    let now = Instant::now();
-                    let should_refresh = match last_tray_triggered_refresh {
-                        Some(last) => now.duration_since(last) >= TRAY_REFRESH_DEBOUNCE,
-                        None => true,
-                    };
-                    if should_refresh {
-                        last_tray_triggered_refresh = Some(now);
-                        let _ = refresh_tx.send(());
                     }
                 }
             }

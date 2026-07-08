@@ -81,13 +81,15 @@ with real progress bars if you want more than a glance.
   than that, on purpose) up to **10 minutes**. Changing it applies
   immediately, no restart needed.
 
-"Refresh now" forces an immediate re-check without waiting for the timer,
-and so does simply hovering over or clicking the tray icon (debounced to at
-most once every 3 seconds so repeated hovering doesn't hammer the endpoint) -
+"Refresh now" forces an immediate re-check without waiting for the timer -
 unless the widget is currently backing off after a failed request (see
-"Why gray?" below), in which case manual refreshes are deliberately ignored
-until the backoff clears, so interacting with the icon can't make a rate-limit
-situation worse.
+"Why gray?" below), in which case it's deliberately ignored until the
+backoff clears, so mashing "Refresh now" can't make a rate-limit situation
+worse. Hovering or clicking the tray icon itself does **not** trigger a
+network request - it just shows whatever was last fetched. (An earlier
+version did refresh on hover, which turned out to be a real bug: casually
+checking the icon a few times fires extra requests on top of the timer,
+and that's what was actually tripping the rate limit described below.)
 
 Only one copy of the widget runs at a time: if you double-click the exe
 while it's already running (or "Start with Windows" launches it and you
