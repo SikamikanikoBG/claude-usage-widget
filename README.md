@@ -42,6 +42,8 @@ to expect on first run.
 
 ### Tray icon
 
+![Tray icon in context, next to the other notification-area icons](docs/tray-icon.png)
+
 A small filled circle, color-coded by your highest current utilization
 across both windows, with that percentage drawn directly on the icon as
 bold, rounded, anti-aliased seven-segment digits (like a digital clock) - no
@@ -71,6 +73,8 @@ Weekly: 54% (resets Wed 18:00)
 ```
 
 ### Right-click menu
+
+![Right-click menu showing the session/weekly progress bars and controls](docs/context-menu.png)
 
 The same two numbers as text progress bars, plus controls:
 
