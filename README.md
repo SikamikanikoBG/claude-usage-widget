@@ -19,99 +19,138 @@ to expect on first run.
 
 ## Install (no Rust required)
 
-1. Grab the latest `claude-usage-widget.exe` - either the direct link above, or from the [Releases page](https://github.com/SikamikanikoBG/claude-usage-widget/releases) if you'd rather see release notes/pick an older version first.
+1. Grab the latest `claude-usage-widget.exe` - either the direct link above,
+   or from the [Releases page](https://github.com/SikamikanikoBG/claude-usage-widget/releases)
+   if you'd rather see release notes/pick an older version first.
 2. Run it. That's it - no installer, no admin rights, nothing else to set up.
 3. Windows may show a SmartScreen warning ("Windows protected your PC") because
    the binary isn't code-signed. Click **More info -> Run anyway**. This is
    normal for small open-source tools - the source is right here if you want
-   to check it or build it yourself instead.
+   to check it or build it yourself instead (see [Building from source](#building-from-source)).
 4. First run: look in the system tray overflow (the `^` arrow near the clock) -
    new tray icons default to hidden on Windows. Drag it out (or enable it via
    *Settings -> Personalization -> Taskbar -> Other system tray icons*) to
-   keep it always visible.
+   keep it always visible. The widget also tries to self-promote its icon out
+   of the overflow area automatically (see [Privacy / what it talks to and
+   touches](#privacy--what-it-talks-to-and-touches)) - if that doesn't take
+   effect right away, dragging it out manually always works.
+5. You'll need to have signed in at least once with the `claude` CLI so its
+   credentials file exists (see
+   [Reliability](#reliability-refresh-backoff-and-why-gray) below).
 
-## What it looks like
+## Features
 
-- **Tray icon**: a small colored dot with your highest current utilization
-  printed right on it as bold seven-segment digits (like a digital clock) -
-  no hovering needed to see the number:
-  - Green: under 50%
-  - Amber: 50-80%
-  - Red: over 80%
-  - Gray, no number: usage data isn't available right now (see "Why gray?"
-    below for what that actually means)
-- **Tooltip** (hover): a two-line summary, e.g.
-  ```
-  Session: 12% (resets in 3h40m)
-  Weekly: 54% (resets Wed 18:00)
-  ```
-- **Right-click menu**: the same two numbers as text progress bars, plus
-  controls:
-  ```
-  Session  [██░░░░░░░░] 12%  resets 3h40m
-  Weekly   [█████░░░░░] 54%  resets Wed 18:00
-  ---------------------------------------------
-  Refresh now
-  ✓ Start with Windows
-  ---------------------------------------------
-  Quit
-  ```
-  If your account has "extra usage" (pay-as-you-go credits beyond the plan
-  limit) enabled, a third informational line shows up right below the two
-  above:
-  ```
-  Session  [██░░░░░░░░] 12%  resets 3h40m
-  Weekly   [█████░░░░░] 54%  resets Wed 18:00
-  Extra usage  [██░░░░░░░░] 12%  42.50/850.00 EUR
-  ---------------------------------------------
-  Refresh now
-  ✓ Start with Windows
-  ---------------------------------------------
-  Quit
-  ```
-  It's left out entirely when extra usage isn't enabled on your account,
-  which is the common case.
-- **Threshold notification**: if either window's utilization crosses 90%
-  (from below 90% up to 90% or higher), you'll get a one-time Windows
-  notification, e.g. "Session at 92%, resets in 1h20m" - it won't repeat
-  again for that same crossing, only once the number drops back below 90%
-  and later crosses again.
-- **Floating usage panel** (optional, off by default): a small always-on-top
-  window in the bottom-right corner with real drawn progress bars for both
-  windows. Turn it on from the tray menu's **Usage panel** submenu, which
-  also lets you pick what it shows: **Both** (stacked), **5-hour only**,
-  **Weekly only**, or **Rotating** (alternates every 2 seconds). Your choice
-  is remembered across restarts.
-- **Poll interval** (tray menu submenu): how often it checks, from **1
-  minute** (the floor - this app will never poll faster than that, on
-  purpose) up to **10 minutes**. Defaults to **5 minutes** - real-world
-  testing showed this undocumented endpoint's own rate limit is stricter
-  than "once a minute" in practice, so 1 minute is available if you want it,
-  but isn't what a fresh install uses out of the box. Changing it applies
-  immediately, no restart needed.
+### Tray icon
 
-"Refresh now" forces an immediate re-check without waiting for the timer -
-unless the widget is currently backing off after a failed request (see
-"Why gray?" below), in which case it's deliberately ignored until the
-backoff clears, so mashing "Refresh now" can't make a rate-limit situation
-worse. Hovering or clicking the tray icon itself does **not** trigger a
-network request - it just shows whatever was last fetched. (An earlier
-version did refresh on hover, which turned out to be a real bug: casually
-checking the icon a few times fires extra requests on top of the timer,
-and that's what was actually tripping the rate limit described below.)
+A small filled circle, color-coded by your highest current utilization
+across both windows, with that percentage drawn directly on the icon as
+bold, rounded, anti-aliased seven-segment digits (like a digital clock) - no
+hovering needed to read the number:
+
+- **Green**: under 50%
+- **Amber**: 50-80%
+- **Red**: over 80%
+- **Gray, no digits**: usage data isn't available right now (see
+  [Reliability](#reliability-refresh-backoff-and-why-gray) for what that
+  actually means)
+
+The badge colors are flat, muted tones closer to iOS/macOS system status
+colors than fully-saturated primary colors, and the digits are rendered as
+one solid color with soft anti-aliased edges and a small gap between
+segments - deliberately not a small pixel font with an outline, which turned
+out to be illegible at real tray-icon size (see [CHANGELOG.md](CHANGELOG.md)
+for why).
+
+### Tooltip
+
+Hovering the icon shows a two-line summary:
+
+```
+Session: 12% (resets in 3h40m)
+Weekly: 54% (resets Wed 18:00)
+```
+
+### Right-click menu
+
+The same two numbers as text progress bars, plus controls:
+
+```
+Session  [██░░░░░░░░] 12%  resets 3h40m
+Weekly   [█████░░░░░] 54%  resets Wed 18:00
+---------------------------------------------
+Refresh now
+✓ Start with Windows
+Usage panel        >
+Poll interval       >
+---------------------------------------------
+Quit
+```
+
+If your account has "extra usage" (pay-as-you-go credits beyond the plan
+limit) enabled, a third informational line shows up right below the two
+above:
+
+```
+Session  [██░░░░░░░░] 12%  resets 3h40m
+Weekly   [█████░░░░░] 54%  resets Wed 18:00
+Extra usage  [██░░░░░░░░] 12%  42.50/850.00 EUR
+---------------------------------------------
+...
+```
+
+It's left out entirely when extra usage isn't enabled on your account, which
+is the common case.
+
+- **Refresh now** - forces an immediate re-check without waiting for the
+  timer, unless the widget is currently backing off after a failed request
+  (see [Reliability](#reliability-refresh-backoff-and-why-gray) below), in
+  which case it's deliberately ignored until the backoff clears.
+- **Start with Windows** - toggles launching the widget at sign-in.
+- **Usage panel** submenu - a **Show panel** checkbox plus four mutually
+  exclusive display-mode options: **Both**, **5-hour only**, **Weekly only**,
+  **Rotating**. See [Floating usage panel](#floating-usage-panel) below.
+- **Poll interval** submenu - **1 minute**, **2 minutes**, **5 minutes**
+  (default), **10 minutes**. Changing it applies immediately, no restart
+  needed. 1 minute is a hard floor enforced in code, not just in the list of
+  offered choices - this widget will never poll faster than that.
+- **Quit**.
+
+Hovering or clicking the tray icon itself does **not** trigger a network
+request - it just shows whatever was last fetched. "Refresh now" is the only
+way to force a check outside of the timer.
+
+### Floating usage panel
+
+An optional always-on-top window, off by default, in the bottom-right corner
+of your primary monitor's work area (above the taskbar, not under it), with
+real drawn progress bars instead of text. Turn it on from the tray menu's
+**Usage panel** submenu, which also lets you pick what it shows: **Both**
+(stacked), **5-hour only**, **Weekly only**, or **Rotating** (alternates
+every 2 seconds). Both the visibility and the chosen mode are remembered
+across restarts.
+
+### Threshold notification
+
+If either window's utilization crosses 90% (from below 90% up to 90% or
+higher), you'll get a one-time Windows balloon notification, e.g. "Session at
+92%, resets in 1h20m". It won't repeat again for that same crossing - only
+once the number drops back below 90% and later crosses again.
+
+### Single instance
 
 Only one copy of the widget runs at a time: if you double-click the exe
-while it's already running (or "Start with Windows" launches it and you
-also start it manually), the second copy notices, prints a message, and
-exits immediately instead of creating a duplicate tray icon.
+while it's already running (or "Start with Windows" launches it and you also
+start it manually), the second copy notices, prints a message, and exits
+immediately instead of creating a duplicate tray icon.
 
-## Why gray? (and why this needs your credentials file)
+## Reliability: refresh, backoff, and "why gray?"
 
 Claude Code caches your OAuth session locally at
-`%USERPROFILE%\.claude\.credentials.json` after you sign in with the `claude`
-CLI. This widget reads the `accessToken` out of that file and calls Anthropic's
-usage endpoint with it - the same way Claude Code's own statusline gets its
-numbers.
+`%USERPROFILE%\.claude\.credentials.json` after you sign in with the
+`claude` CLI. This widget reads the `accessToken` out of that file (fresh,
+on every poll) and calls Anthropic's usage endpoint with it - the same way
+Claude Code's own statusline gets its numbers. This is an **undocumented**
+endpoint with no public token-refresh flow.
 
 The icon turns gray whenever a fetch fails, but the tooltip/menu text tells
 you *why*, because the fix is different depending on the cause:
@@ -120,29 +159,60 @@ you *why*, because the fix is different depending on the cause:
   server rejected the token outright (HTTP 401/403). This is the one case
   that actually needs you to do something: run `claude` once to refresh your
   session, and the widget picks up the new token on its next check.
-- **"rate-limited, retrying"** - this undocumented endpoint has its own rate
-  limit, separate from your actual usage quota. Polling too fast (or several
-  tools/test runs hitting it around the same time) can trigger a temporary
-  HTTP 429. The widget backs off automatically (starting at your configured
-  poll interval and doubling on repeated failures, up to 5 minutes) and
-  recovers on its own - no action needed, and manual refreshes are ignored
-  during the backoff so they can't make it worse.
-- **"network error, retrying"** / **"unavailable, retrying"** - a connectivity
-  hiccup or an unexpected response shape; also self-recovers on the next poll.
+- **"rate-limited, retrying"** - this endpoint has its own rate limit,
+  separate from your actual usage quota. The widget backs off automatically
+  and recovers on its own - no action needed, and manual refreshes are
+  ignored during the backoff so they can't make it worse.
+- **"network error, retrying"** / **"unavailable, retrying"** - a
+  connectivity hiccup or an unexpected response shape; also self-recovers on
+  the next poll.
 
-This is an **undocumented** endpoint with no public token-refresh flow, so
-"sign-in needed" is the only case this widget can't fix by itself.
+Failures use **two separate backoff schedules**, not one, because they don't
+behave the same way in practice:
 
-## Privacy / what it talks to
+- An actual **HTTP 429** gets a cautious exponential backoff (doubling from
+  the current poll interval, capped at 5 minutes), and respects a
+  server-sent `Retry-After` header when there's a sane one to trust - a
+  `Retry-After: 0` observed live while actively rate-limited is treated as a
+  floor, not something that can shrink the backoff below the computed
+  schedule.
+- Everything else - a network error, an unparseable response, a token
+  problem - gets a much faster **5-second to 60-second** schedule instead.
+  These are usually short-lived hiccups (a stale connection surviving a
+  sleep/wake cycle, for example) that don't need minutes to recover from; a
+  network-transport-level failure specifically also rebuilds the HTTP client
+  before the next attempt, in case the connection itself was the problem.
+
+Both schedules reset back to the normal poll interval on the next success.
+
+## Privacy / what it talks to and touches
 
 This widget makes network requests to **`api.anthropic.com` only**, using
-**your own already-cached token** - nothing else, no analytics, no telemetry,
-no third-party service. It only reads one local file (your existing Claude
-Code credentials cache) and only writes to one registry location, and only if
-you turn on "Start with Windows":
-`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`. It writes
-no files of its own. The source is small enough to read end to end in a few
-minutes - that's the point of it being open source.
+**your own already-cached token** - nothing else, no analytics, no
+telemetry, no third-party service.
+
+It reads exactly one local file: your existing Claude Code credentials cache
+at `%USERPROFILE%\.claude\.credentials.json`.
+
+It writes to exactly three registry locations, and nothing else:
+
+- `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` - the
+  standard per-user autostart key, and only the single `ClaudeUsageWidget`
+  value in it. Written only if you turn on "Start with Windows"; removed
+  again if you turn it off.
+- `HKEY_CURRENT_USER\Software\ClaudeUsageWidget` - this widget's own
+  settings key, holding the floating panel's visibility and mode and the
+  configured poll interval. Updated whenever you change those from the tray
+  menu.
+- `HKEY_CURRENT_USER\Control Panel\NotifyIconSettings` - a key Windows
+  itself owns and maintains for every app that has ever registered a tray
+  icon. The widget only sets the `IsPromoted` value (a DWORD) on its own
+  existing subkey there, to ask Windows to keep the icon always visible
+  instead of hidden behind the overflow chevron. It doesn't create this key
+  or touch any other app's entry in it.
+
+It writes no files of its own. The source is small enough to read end to end
+in a few minutes - that's the point of it being open source.
 
 ## Building from source
 
@@ -161,41 +231,32 @@ single self-contained executable - copy it wherever you like and run it.
 
 ## Running
 
-Just double-click `claude-usage-widget.exe`, or run it from a terminal.
-It has no window - only a tray icon appears (look in the system tray overflow
+Just double-click `claude-usage-widget.exe`, or run it from a terminal. It
+has no window - only a tray icon appears (look in the system tray overflow
 arrow if you don't see it right away). You'll need to have signed in with
 Claude Code at least once (`claude` CLI) so the credentials file exists.
 
 To have it launch automatically at sign-in, right-click the tray icon and
 check "Start with Windows".
 
-## How it works, briefly
+## How it works, internally
 
 - A background thread polls `GET https://api.anthropic.com/api/oauth/usage`
   at your configured interval (1-10 minutes, 5-minute default, 1-minute
   floor), re-reading the credentials file on every attempt so it picks up a
   refreshed token without needing a restart.
-- On failure, it backs off - but on two different schedules depending on
-  what went wrong. An actual HTTP 429 gets a cautious exponential backoff
-  (doubling from the poll interval, up to a 5-minute cap) and respects a
-  server-sent `Retry-After` header when there's a sane one to respect, so a
-  real rate-limit situation self-heals instead of turning into a retry
-  storm. Anything else - a network error, an unparseable response, a token
-  problem - gets a much faster 5s-to-60s schedule instead, since those are
-  usually short-lived hiccups (a stale connection after the machine
-  sleeps/wakes, for example) that don't need minutes to recover from. A
-  network-transport-level failure specifically also rebuilds the HTTP
-  client before the next attempt, in case the connection itself was stale.
+- On failure, it uses one of the two backoff schedules described above
+  (429 vs. everything else), tracked as a count of consecutive failures that
+  resets to zero on the next success.
 - A named Win32 mutex (`Global\ClaudeUsageWidget_SingleInstance`) guards
   against two copies running at once; a second launch detects the existing
   mutex and exits immediately, before creating any UI.
-- The tray icon is rendered in memory (bold seven-segment digits blitted
-  onto an anti-aliased filled circle) rather than shipped as a static asset
+- The tray icon is rendered in memory (anti-aliased filled circle with bold
+  seven-segment digits blitted on top) rather than shipped as a static asset
   file, so the color and number always match the live data.
 - The floating usage panel is a plain always-on-top Win32 popup window,
-  positioned from the primary monitor's work area (so it sits above the
-  taskbar, not under it), drawn with raw GDI calls - no extra windowing/UI
-  crate.
+  positioned from the primary monitor's work area, drawn with raw GDI calls -
+  no extra windowing/UI crate.
 - The 90%-threshold notification is a plain Win32 balloon/toast shown via
   `Shell_NotifyIconW`, not a separate notification library.
 - Built with [`tray-icon`](https://crates.io/crates/tray-icon) +
