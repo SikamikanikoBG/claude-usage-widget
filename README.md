@@ -11,9 +11,15 @@ with real progress bars if you want more than a glance.
 ![platform](https://img.shields.io/badge/platform-Windows-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
+### [**⬇ Download claude-usage-widget.exe**](https://github.com/SikamikanikoBG/claude-usage-widget/releases/latest/download/claude-usage-widget.exe)
+
+That link always points at the latest release - no need to hunt through
+version numbers. See [Install](#install-no-rust-required) below for what
+to expect on first run.
+
 ## Install (no Rust required)
 
-1. Grab the latest `claude-usage-widget.exe` from the [Releases page](https://github.com/SikamikanikoBG/claude-usage-widget/releases).
+1. Grab the latest `claude-usage-widget.exe` - either the direct link above, or from the [Releases page](https://github.com/SikamikanikoBG/claude-usage-widget/releases) if you'd rather see release notes/pick an older version first.
 2. Run it. That's it - no installer, no admin rights, nothing else to set up.
 3. Windows may show a SmartScreen warning ("Windows protected your PC") because
    the binary isn't code-signed. Click **More info -> Run anyway**. This is
@@ -27,8 +33,8 @@ with real progress bars if you want more than a glance.
 ## What it looks like
 
 - **Tray icon**: a small colored dot with your highest current utilization
-  printed right on it (bold, outlined so it stays legible on any of the
-  colors below) - no hovering needed to see the number:
+  printed right on it as bold seven-segment digits (like a digital clock) -
+  no hovering needed to see the number:
   - Green: under 50%
   - Amber: 50-80%
   - Red: over 80%
@@ -183,7 +189,7 @@ check "Start with Windows".
 - A named Win32 mutex (`Global\ClaudeUsageWidget_SingleInstance`) guards
   against two copies running at once; a second launch detects the existing
   mutex and exits immediately, before creating any UI.
-- The tray icon is rendered in memory (a bolded, outlined digit font blitted
+- The tray icon is rendered in memory (bold seven-segment digits blitted
   onto an anti-aliased filled circle) rather than shipped as a static asset
   file, so the color and number always match the live data.
 - The floating usage panel is a plain always-on-top Win32 popup window,

@@ -27,10 +27,16 @@ jobs:
         run: |
           $version = "${{ github.ref_name }}"
           Copy-Item target/release/claude-usage-widget.exe "claude-usage-widget-$version.exe"
+          # Also published under a stable, version-agnostic name so
+          # /releases/latest/download/claude-usage-widget.exe is a
+          # permanent direct-download link that never needs updating in
+          # the README when a new version ships.
+          Copy-Item target/release/claude-usage-widget.exe "claude-usage-widget.exe"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             claude-usage-widget-*.exe
+            claude-usage-widget.exe
           generate_release_notes: true

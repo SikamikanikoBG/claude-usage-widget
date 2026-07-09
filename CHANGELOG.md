@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0]
+
+### Changed
+
+- Redesigned the tray icon's percentage digits from a small pixel font
+  (bolded via dilation, with a separate outline layer) to bold seven-segment
+  digits, like a digital clock. A real screenshot of the tray icon showed
+  the previous design rendering as an illegible blur at actual tray-icon
+  size (16-24 physical pixels) -- badly enough that it read as a garbled
+  face rather than a number -- even though it looked fine in this project's
+  own downscaled preview tests. Two lessons from that: simulating the
+  downscale with a different resize algorithm than whatever Windows Shell
+  actually uses for notification icons gives false confidence, and
+  outline-plus-fill adds a second set of parallel edges that blur together
+  at tiny sizes. Seven-segment digits are bold rectangular blocks in one
+  flat color with no separate outline -- the same design choice that makes
+  them legible on low-resolution LED/LCD displays.
+
 ## [0.3.3]
 
 ### Fixed

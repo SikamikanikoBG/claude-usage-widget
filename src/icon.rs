@@ -1,10 +1,25 @@
 // Renders the tray icon in-memory as an RGBA ring, color-coded by usage,
-// with the highest current utilization percentage drawn as text on top of
-// it. No external .ico asset and no font-rendering crate are needed: digits
-// are drawn from a small hardcoded 5x7 pixel font (see `DIGIT_FONT` below),
-// bolded via bit-level dilation and given a high-contrast outline (see
-// `draw_percentage`) so they stay legible at real tray-icon size regardless
-// of the badge color underneath.
+// with the highest current utilization percentage drawn as digits on top of
+// it. No external .ico asset and no font-rendering crate are needed.
+//
+// Digits are drawn as bold seven-segment shapes (like a digital clock),
+// not a small pixel font -- this is a deliberate redesign after a real
+// screenshot showed the previous dilated-glyph-plus-outline approach
+// rendering as an illegible blur at actual tray-icon size (16-24 physical
+// pixels), even though it looked fine in this crate's own downscaled
+// preview tests. Two things changed to fix that:
+//   1. Simulating the downscale myself (via a different resize algorithm
+//      than whatever Windows Shell actually uses for notification icons)
+//      gave false confidence -- the real rendering was worse than the
+//      simulated one. Ground truth has to come from an actual screenshot
+//      of the real tray icon, not a local preview.
+//   2. Outline-plus-fill adds a second set of parallel edges that blur
+//      together at tiny sizes, which is likely exactly what made digits
+//      look like a blob (described as looking like a face) rather than
+//      numbers. Seven-segment digits are bold rectangular blocks with a
+//      single edge each -- the same design choice that makes them legible
+//      on low-resolution LED/LCD displays -- and are drawn in one flat
+//      color with no separate outline layer.
 
 use crate::usage::TrayState;
 
@@ -95,69 +110,33 @@ fn luminance(c: [u8; 3]) -> f32 {
     0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32
 }
 
-/// Picks (fill, outline) colors for the percentage text against the given
-/// badge background: whichever of black/white contrasts better with `bg`
-/// is the fill, and the other is the outline drawn one ring around it. This
-/// way the digits stay readable regardless of which badge color (green/
-/// amber/red/gray) they land on, rather than relying on a single contrast
-/// pick alone.
-fn text_colors_for(bg: [u8; 3]) -> ([u8; 3], [u8; 3]) {
+/// Single flat color for the percentage digits against the given badge
+/// background: whichever of black/white contrasts better with `bg`. No
+/// separate outline color is needed -- see the module-level comment on why
+/// outline-plus-fill was dropped.
+fn text_color_for(bg: [u8; 3]) -> [u8; 3] {
     if luminance(bg) > 140.0 {
-        ([0, 0, 0], [255, 255, 255])
+        [0, 0, 0]
     } else {
-        ([255, 255, 255], [0, 0, 0])
+        [255, 255, 255]
     }
 }
 
-/// 5 wide x 7 tall bitmap font for digits 0-9, one row per byte using the
-/// low 5 bits (bit 4 = leftmost pixel, bit 0 = rightmost pixel).
-const DIGIT_FONT: [[u8; 7]; 10] = [
-    // 0
-    [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
-    // 1
-    [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-    // 2
-    [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
-    // 3
-    [0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110],
-    // 4
-    [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
-    // 5
-    [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
-    // 6
-    [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
-    // 7
-    [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
-    // 8
-    [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
-    // 9
-    [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+/// Which of the 7 segments (in `A, B, C, D, E, F, G` order -- top, top-right,
+/// bottom-right, bottom, bottom-left, top-left, middle) are lit for each
+/// digit 0-9. Standard seven-segment-display layout.
+const SEGMENTS: [[bool; 7]; 10] = [
+    [true, true, true, true, true, true, false],   // 0
+    [false, true, true, false, false, false, false], // 1
+    [true, true, false, true, true, false, true],  // 2
+    [true, true, true, true, false, false, true],  // 3
+    [false, true, true, false, false, true, true], // 4
+    [true, false, true, true, false, true, true],  // 5
+    [true, false, true, true, true, true, true],   // 6
+    [true, true, true, false, false, false, false], // 7
+    [true, true, true, true, true, true, true],    // 8
+    [true, true, true, true, false, true, true],   // 9
 ];
-
-const FONT_W: u32 = 5;
-const FONT_H: u32 = 7;
-
-/// Bigger digits when there are fewer of them, so a single-digit percentage
-/// (the common case) isn't tiny just to leave room for a 3-digit "100" that
-/// only happens at the very cap.
-fn scale_for_digit_count(len: usize) -> u32 {
-    match len {
-        1 => 9,
-        2 => 6,
-        _ => 4,
-    }
-}
-
-/// Outline thickness in pixels, proportional to `scale` rather than a flat
-/// constant: an outline that's fine at the large 1-digit scale would bleed
-/// two adjacent 2-3 digit glyphs into an illegible blob if reused as-is (an
-/// earlier version of this function did exactly that -- verified by
-/// rendering + downscaling actual previews, see the icon preview dump test
-/// below). Capped at 3px so it never gets thick enough to swallow the
-/// glyph's own strokes at any digit count.
-fn outline_px_for_scale(scale: u32) -> i32 {
-    ((scale / 3).max(1) as i32).min(3)
-}
 
 fn digits_of(pct: u32) -> Vec<u8> {
     let pct = pct.min(999); // defensive; usage.rs already clamps to 0..=100
@@ -174,115 +153,90 @@ fn digits_of(pct: u32) -> Vec<u8> {
     digits
 }
 
-/// Grows a boolean `size` x `size` mask by `radius` pixels in every
-/// direction (Chebyshev/box dilation): a pixel is "on" in the output if any
-/// pixel within `radius` of it is "on" in the input. Used to build the
-/// outline ring around the (already bolded) glyph mask.
-fn dilate_mask(mask: &[bool], size: i32, radius: i32) -> Vec<bool> {
-    let mut out = vec![false; mask.len()];
-    for y in 0..size {
-        for x in 0..size {
-            let mut on = false;
-            'search: for dy in -radius..=radius {
-                let ny = y + dy;
-                if ny < 0 || ny >= size {
-                    continue;
-                }
-                for dx in -radius..=radius {
-                    let nx = x + dx;
-                    if nx < 0 || nx >= size {
-                        continue;
-                    }
-                    if mask[(ny * size + nx) as usize] {
-                        on = true;
-                        break 'search;
-                    }
-                }
-            }
-            out[(y * size + x) as usize] = on;
-        }
+/// (digit width, digit height, gap between digits) in pixels, on the `SIZE`
+/// canvas. Bigger and bolder for fewer digits, same reasoning as before:
+/// the common case (1-2 digits) shouldn't be sized down just to leave room
+/// for the rare 3-digit "100".
+fn digit_box_for_count(len: usize) -> (i32, i32, i32) {
+    match len {
+        1 => (52, 80, 0),
+        2 => (36, 72, 8),
+        _ => (24, 60, 4),
     }
-    out
 }
 
-/// Blits the percentage as 1-3 digits, centered, onto the RGBA buffer: first
-/// as a bolded (dilated) ink mask, then an outline ring dilated further out
-/// from that, drawn outline-first so the ink fill ends up on top. `bg` is
-/// the badge color the icon was already filled with, used to pick a fill/
-/// outline color pair that contrasts with it.
+fn fill_rect(rgba: &mut [u8], x0: i32, y0: i32, w: i32, h: i32, color: [u8; 3]) {
+    for y in y0.max(0)..(y0 + h).min(SIZE as i32) {
+        for x in x0.max(0)..(x0 + w).min(SIZE as i32) {
+            let idx = ((y as u32 * SIZE + x as u32) * 4) as usize;
+            rgba[idx] = color[0];
+            rgba[idx + 1] = color[1];
+            rgba[idx + 2] = color[2];
+            rgba[idx + 3] = 255;
+        }
+    }
+}
+
+/// Draws one digit as bold seven-segment bars within the `w`x`h` box at
+/// (`x0`, `y0`). Segment thickness is proportional to the box size (roughly
+/// a quarter of the width) rather than a flat pixel count, so it stays
+/// equally bold whether this is a big single digit or a small one sharing
+/// space with two others.
+fn draw_seven_segment_digit(rgba: &mut [u8], x0: i32, y0: i32, w: i32, h: i32, digit: u8, color: [u8; 3]) {
+    let segs = SEGMENTS[digit as usize];
+    let t = (w / 4).max(5); // segment thickness: bold on purpose
+
+    let top_y = y0;
+    let mid_y = y0 + h / 2 - t / 2;
+    let bot_y = y0 + h - t;
+
+    // A: top, D: bottom, G: middle -- full-width horizontal bars.
+    if segs[0] {
+        fill_rect(rgba, x0, top_y, w, t, color);
+    }
+    if segs[3] {
+        fill_rect(rgba, x0, bot_y, w, t, color);
+    }
+    if segs[6] {
+        fill_rect(rgba, x0, mid_y, w, t, color);
+    }
+
+    let upper_h = mid_y - (top_y + t);
+    let lower_h = bot_y - (mid_y + t);
+
+    // F: top-left, B: top-right -- verticals from below the top bar to the
+    // middle bar.
+    if segs[5] {
+        fill_rect(rgba, x0, top_y + t, t, upper_h, color);
+    }
+    if segs[1] {
+        fill_rect(rgba, x0 + w - t, top_y + t, t, upper_h, color);
+    }
+    // E: bottom-left, C: bottom-right -- verticals from below the middle bar
+    // to the bottom bar.
+    if segs[4] {
+        fill_rect(rgba, x0, mid_y + t, t, lower_h, color);
+    }
+    if segs[2] {
+        fill_rect(rgba, x0 + w - t, mid_y + t, t, lower_h, color);
+    }
+}
+
+/// Draws the percentage as 1-3 bold seven-segment digits, centered, in a
+/// single flat color chosen to contrast with `bg` (the badge color the icon
+/// was already filled with).
 fn draw_percentage(rgba: &mut [u8], pct: u32, bg: [u8; 3]) {
     let digits = digits_of(pct);
-    let scale = scale_for_digit_count(digits.len());
-    let outline_px = outline_px_for_scale(scale);
-    // Leave enough of a gap between digit cells that two adjacent glyphs'
-    // outline rings can never touch (which would fuse them into one blob).
-    let spacing = scale + outline_px as u32 * 2;
+    let (digit_w, digit_h, gap) = digit_box_for_count(digits.len());
+    let total_w = digits.len() as i32 * digit_w + (digits.len() as i32 - 1) * gap;
 
-    let glyph_w = FONT_W * scale;
-    let glyph_h = FONT_H * scale;
-    let total_w = digits.len() as u32 * glyph_w + (digits.len() as u32 - 1) * spacing;
-
-    let start_x = (SIZE as i64 - total_w as i64) / 2;
-    let start_y = (SIZE as i64 - glyph_h as i64) / 2;
-
-    let mut ink = vec![false; (SIZE * SIZE) as usize];
+    let start_x = (SIZE as i32 - total_w) / 2;
+    let start_y = (SIZE as i32 - digit_h) / 2;
+    let color = text_color_for(bg);
 
     for (i, &digit) in digits.iter().enumerate() {
-        let glyph = DIGIT_FONT[digit as usize];
-        let digit_x0 = start_x + i as i64 * (glyph_w + spacing) as i64;
-
-        for row in 0..FONT_H {
-            let bits = glyph[row as usize];
-            for col in 0..FONT_W {
-                if bits & (1 << (FONT_W - 1 - col)) == 0 {
-                    continue;
-                }
-                // Blit this font pixel as a scale x scale block. The
-                // boldness here comes entirely from the outline ring drawn
-                // around this ink mask below, not from thickening the ink
-                // itself -- dilating the strokes *and* outlining them both
-                // was tried and over-thickened badly enough that adjacent
-                // digits fused into a blob at real tray size (see the
-                // preview-dump test at the bottom of this file).
-                for sy in 0..scale {
-                    for sx in 0..scale {
-                        let x = digit_x0 + (col * scale + sx) as i64;
-                        let y = start_y + (row * scale + sy) as i64;
-                        if x < 0 || y < 0 || x >= SIZE as i64 || y >= SIZE as i64 {
-                            continue;
-                        }
-                        ink[(y as u32 * SIZE + x as u32) as usize] = true;
-                    }
-                }
-            }
-        }
-    }
-
-    let outline = dilate_mask(&ink, SIZE as i32, outline_px);
-    let (fill_color, outline_color) = text_colors_for(bg);
-
-    // Outline first (drawn everywhere the dilated ring covers, including
-    // under the ink), then the ink fill on top -- leaving only the ring
-    // around the glyph visible in the outline color.
-    for (idx, &on) in outline.iter().enumerate() {
-        if !on {
-            continue;
-        }
-        let px = idx * 4;
-        rgba[px] = outline_color[0];
-        rgba[px + 1] = outline_color[1];
-        rgba[px + 2] = outline_color[2];
-        rgba[px + 3] = 255;
-    }
-    for (idx, &on) in ink.iter().enumerate() {
-        if !on {
-            continue;
-        }
-        let px = idx * 4;
-        rgba[px] = fill_color[0];
-        rgba[px + 1] = fill_color[1];
-        rgba[px + 2] = fill_color[2];
-        rgba[px + 3] = 255;
+        let x0 = start_x + i as i32 * (digit_w + gap);
+        draw_seven_segment_digit(rgba, x0, start_y, digit_w, digit_h, digit, color);
     }
 }
 
@@ -291,38 +245,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dilate_mask_only_ever_adds_pixels() {
-        // A single lit pixel in the middle of a 9x9 mask, dilated by 2,
-        // must still cover that original pixel plus strictly more area
-        // around it -- dilation should only ever add coverage, never
-        // remove or shift it.
-        let size = 9;
-        let mut mask = vec![false; (size * size) as usize];
-        mask[(4 * size + 4) as usize] = true;
-
-        let dilated = dilate_mask(&mask, size, 2);
-        assert!(dilated[(4 * size + 4) as usize], "original pixel must survive dilation");
-        let before: usize = mask.iter().filter(|&&on| on).count();
-        let after: usize = dilated.iter().filter(|&&on| on).count();
-        assert!(after > before, "dilation should grow coverage");
+    fn digit_boxes_fit_within_the_canvas() {
+        // Regression guard: whatever box size/gap is chosen per digit
+        // count, the total width must actually fit on the SIZE x SIZE
+        // canvas (with room to spare for centering), or digits would get
+        // clipped at the edges instead of just looking small.
+        for len in 1..=3usize {
+            let (w, h, gap) = digit_box_for_count(len);
+            let total_w = len as i32 * w + (len as i32 - 1) * gap;
+            assert!(total_w <= SIZE as i32, "{len}-digit total width {total_w} exceeds canvas {SIZE}");
+            assert!(h <= SIZE as i32, "{len}-digit height {h} exceeds canvas {SIZE}");
+        }
     }
 
     #[test]
-    fn outline_stays_bounded_across_digit_counts() {
-        // Regression guard for the over-bolding bug this file's history
-        // hit: an early version dilated the font glyph itself *and* drew a
-        // flat 4px outline, which fused adjacent 2-3 digit glyphs into a
-        // solid blob once rendered and downscaled to real tray size (see
-        // the preview-dump test below). The outline must stay small
-        // relative to `scale` no matter the digit count.
-        for len in 1..=3 {
-            let scale = scale_for_digit_count(len);
-            let outline = outline_px_for_scale(scale);
-            assert!(outline >= 1, "outline must stay visible");
-            assert!(
-                (outline as u32) * 2 < scale,
-                "outline ({outline}px) is too large relative to scale ({scale}px) for {len}-digit glyphs and would bleed into neighboring digits"
-            );
+    fn segment_thickness_leaves_room_for_a_middle_gap() {
+        // The middle bar (G) sits between the upper and lower vertical
+        // segments; if segment thickness were ever too large relative to
+        // digit height, the upper/lower verticals would have zero or
+        // negative height and segments would overlap into a solid blob
+        // instead of a legible digit shape.
+        for len in 1..=3usize {
+            let (w, h, _gap) = digit_box_for_count(len);
+            let t = (w / 4).max(5);
+            let mid_y = h / 2 - t / 2;
+            let upper_h = mid_y - t;
+            let lower_h = (h - t) - (mid_y + t);
+            assert!(upper_h > 0, "{len}-digit upper vertical segment has non-positive height");
+            assert!(lower_h > 0, "{len}-digit lower vertical segment has non-positive height");
         }
     }
 
