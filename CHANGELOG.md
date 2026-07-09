@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.1]
+
+### Changed
+
+- Visual design pass on the seven-segment digits introduced in 0.4.0:
+  legible but "doesn't look professional" per real-world feedback on a
+  fresh screenshot. Segments are now rounded (not raw rectangles) with
+  soft anti-aliased edges (the same analytic-AA technique already used for
+  the outer badge circle) instead of hard pixel cutoffs, and inset from
+  each other by a small gap so they read as distinct segments rather than
+  a fused block. Badge colors also swapped from fully-saturated primary
+  hues to flatter, more refined tones closer to iOS/macOS system status
+  colors (systemGreen/systemOrange/systemRed/systemGray), which read as
+  "status indicator" rather than "hazard sign."
+
 ## [0.4.0]
 
 ### Changed

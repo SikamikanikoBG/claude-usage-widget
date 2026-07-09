@@ -23,10 +23,15 @@
 
 use crate::usage::TrayState;
 
-pub const GREEN: [u8; 3] = [45, 164, 78];
-pub const AMBER: [u8; 3] = [222, 163, 30];
-pub const RED: [u8; 3] = [216, 59, 59];
-pub const GRAY: [u8; 3] = [140, 140, 140];
+// Tuned to read as "refined status indicator" rather than "hazard sign" --
+// closer to the flat system-status colors iOS/macOS use (systemGreen/
+// systemOrange/systemRed/systemGray) than fully-saturated primary colors,
+// which is part of what made the earlier badge look more like a warning
+// label than an app icon.
+pub const GREEN: [u8; 3] = [48, 209, 88];
+pub const AMBER: [u8; 3] = [255, 159, 10];
+pub const RED: [u8; 3] = [255, 69, 58];
+pub const GRAY: [u8; 3] = [142, 142, 147];
 
 // Bumped from 64 (which itself was bumped from the original 32) so the
 // bolded, outlined glyphs below have enough headroom to stay proportionally
@@ -165,14 +170,58 @@ fn digit_box_for_count(len: usize) -> (i32, i32, i32) {
     }
 }
 
-fn fill_rect(rgba: &mut [u8], x0: i32, y0: i32, w: i32, h: i32, color: [u8; 3]) {
-    for y in y0.max(0)..(y0 + h).min(SIZE as i32) {
-        for x in x0.max(0)..(x0 + w).min(SIZE as i32) {
-            let idx = ((y as u32 * SIZE + x as u32) * 4) as usize;
-            rgba[idx] = color[0];
-            rgba[idx + 1] = color[1];
-            rgba[idx + 2] = color[2];
-            rgba[idx + 3] = 255;
+/// Blends `color` into the pixel at (`x`, `y`) with the given coverage
+/// (0.0 = untouched, 1.0 = fully replaced). No-op outside the canvas or at
+/// zero coverage. This is what makes segment edges soft/anti-aliased
+/// instead of hard-cut, the same idea already used for the outer circle's
+/// edge below, just reused per-segment instead of per-badge.
+fn blend_pixel(rgba: &mut [u8], x: i32, y: i32, color: [u8; 3], coverage: f32) {
+    if x < 0 || y < 0 || x >= SIZE as i32 || y >= SIZE as i32 || coverage <= 0.0 {
+        return;
+    }
+    let coverage = coverage.min(1.0);
+    let idx = ((y as u32 * SIZE + x as u32) * 4) as usize;
+    for c in 0..3 {
+        let existing = rgba[idx + c] as f32;
+        let target = color[c] as f32;
+        rgba[idx + c] = (existing + (target - existing) * coverage).round() as u8;
+    }
+    rgba[idx + 3] = 255;
+}
+
+/// Anti-aliased coverage (0.0-1.0) of a rounded rectangle centered at
+/// (`cx`, `cy`) with half-extents (`half_w`, `half_h`) and corner radius
+/// `r`, at point (`px`, `py`). Standard rounded-box signed-distance-field
+/// formula with a ~1px soft edge, the same analytic-AA approach the outer
+/// badge circle already uses.
+fn rounded_rect_coverage(px: f32, py: f32, cx: f32, cy: f32, half_w: f32, half_h: f32, r: f32) -> f32 {
+    let dx = (px - cx).abs() - (half_w - r);
+    let dy = (py - cy).abs() - (half_h - r);
+    let outside_dist = dx.max(0.0).hypot(dy.max(0.0));
+    let signed_dist = outside_dist - r;
+    (0.5 - signed_dist).clamp(0.0, 1.0)
+}
+
+/// Fills a rounded rectangle with soft anti-aliased edges. Corner radius is
+/// proportional to the smaller side (capped) rather than a flat pixel
+/// count, so small and large segments both read as "rounded", not just the
+/// big ones.
+fn fill_rounded_rect(rgba: &mut [u8], x0: i32, y0: i32, w: i32, h: i32, color: [u8; 3]) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let half_w = w as f32 / 2.0;
+    let half_h = h as f32 / 2.0;
+    let cx = x0 as f32 + half_w;
+    let cy = y0 as f32 + half_h;
+    let r = (w.min(h) as f32 * 0.35).clamp(1.0, 4.0);
+
+    let pad = 2; // room for the ~1px AA falloff outside the nominal box
+    for y in (y0 - pad).max(0)..(y0 + h + pad).min(SIZE as i32) {
+        for x in (x0 - pad).max(0)..(x0 + w + pad).min(SIZE as i32) {
+            let coverage =
+                rounded_rect_coverage(x as f32 + 0.5, y as f32 + 0.5, cx, cy, half_w, half_h, r);
+            blend_pixel(rgba, x, y, color, coverage);
         }
     }
 }
@@ -181,44 +230,49 @@ fn fill_rect(rgba: &mut [u8], x0: i32, y0: i32, w: i32, h: i32, color: [u8; 3]) 
 /// (`x0`, `y0`). Segment thickness is proportional to the box size (roughly
 /// a quarter of the width) rather than a flat pixel count, so it stays
 /// equally bold whether this is a big single digit or a small one sharing
-/// space with two others.
+/// space with two others. Segments are inset from each other by a small
+/// gap (real seven-segment displays have one too) and rounded/anti-aliased
+/// rather than hard rectangles, so this reads as a deliberately designed
+/// badge rather than raw LEGO-block digits.
 fn draw_seven_segment_digit(rgba: &mut [u8], x0: i32, y0: i32, w: i32, h: i32, digit: u8, color: [u8; 3]) {
     let segs = SEGMENTS[digit as usize];
     let t = (w / 4).max(5); // segment thickness: bold on purpose
+    let gap = (t / 4).max(1); // visual separation between adjoining segments
 
     let top_y = y0;
     let mid_y = y0 + h / 2 - t / 2;
     let bot_y = y0 + h - t;
 
-    // A: top, D: bottom, G: middle -- full-width horizontal bars.
+    // A: top, D: bottom, G: middle -- full-width horizontal bars, inset a
+    // touch on each end so they don't visually fuse with the verticals.
     if segs[0] {
-        fill_rect(rgba, x0, top_y, w, t, color);
+        fill_rounded_rect(rgba, x0 + gap, top_y, w - 2 * gap, t, color);
     }
     if segs[3] {
-        fill_rect(rgba, x0, bot_y, w, t, color);
+        fill_rounded_rect(rgba, x0 + gap, bot_y, w - 2 * gap, t, color);
     }
     if segs[6] {
-        fill_rect(rgba, x0, mid_y, w, t, color);
+        fill_rounded_rect(rgba, x0 + gap, mid_y, w - 2 * gap, t, color);
     }
 
-    let upper_h = mid_y - (top_y + t);
-    let lower_h = bot_y - (mid_y + t);
+    let upper_h = mid_y - (top_y + t) - gap;
+    let lower_h = bot_y - (mid_y + t) - gap;
 
     // F: top-left, B: top-right -- verticals from below the top bar to the
     // middle bar.
     if segs[5] {
-        fill_rect(rgba, x0, top_y + t, t, upper_h, color);
+        fill_rounded_rect(rgba, x0, top_y + t + gap, t, upper_h, color);
     }
     if segs[1] {
-        fill_rect(rgba, x0 + w - t, top_y + t, t, upper_h, color);
+        fill_rounded_rect(rgba, x0 + w - t, top_y + t + gap, t, upper_h, color);
     }
     // E: bottom-left, C: bottom-right -- verticals from below the middle bar
     // to the bottom bar.
     if segs[4] {
-        fill_rect(rgba, x0, mid_y + t, t, lower_h, color);
+        fill_rounded_rect(rgba, x0, mid_y + t + gap, t, lower_h, color);
     }
     if segs[2] {
-        fill_rect(rgba, x0 + w - t, mid_y + t, t, lower_h, color);
+        fill_rounded_rect(rgba, x0 + w - t, mid_y + t + gap, t, lower_h, color);
     }
 }
 
@@ -261,16 +315,20 @@ mod tests {
     #[test]
     fn segment_thickness_leaves_room_for_a_middle_gap() {
         // The middle bar (G) sits between the upper and lower vertical
-        // segments; if segment thickness were ever too large relative to
-        // digit height, the upper/lower verticals would have zero or
-        // negative height and segments would overlap into a solid blob
-        // instead of a legible digit shape.
+        // segments, each further inset by a small visual `gap`; if segment
+        // thickness (or the gap) were ever too large relative to digit
+        // height, the upper/lower verticals would have zero or negative
+        // height and segments would overlap into a solid blob instead of a
+        // legible digit shape. Mirrors the real layout math in
+        // `draw_seven_segment_digit` exactly (including the gap inset),
+        // not just an approximation of it.
         for len in 1..=3usize {
-            let (w, h, _gap) = digit_box_for_count(len);
+            let (w, h, _spacing) = digit_box_for_count(len);
             let t = (w / 4).max(5);
+            let gap = (t / 4).max(1);
             let mid_y = h / 2 - t / 2;
-            let upper_h = mid_y - t;
-            let lower_h = (h - t) - (mid_y + t);
+            let upper_h = mid_y - t - gap;
+            let lower_h = (h - t) - (mid_y + t) - gap;
             assert!(upper_h > 0, "{len}-digit upper vertical segment has non-positive height");
             assert!(lower_h > 0, "{len}-digit lower vertical segment has non-positive height");
         }
