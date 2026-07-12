@@ -8,11 +8,27 @@
 // shape change, ...) we fall back to a neutral "unavailable" state instead
 // of crashing, and simply try again on the next timer tick.
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Duration, Local, Utc};
 use serde::Deserialize;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const ANTHROPIC_BETA: &str = "oauth-2025-04-20";
+
+/// The weekly ("seven_day") limit window is exactly 7 days long. The usage
+/// endpoint only tells us when it *resets* (the end of the window), so the
+/// window start -- needed to work out how far through it we currently are --
+/// is derived as `resets_at - 7 days`.
+const WEEKLY_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// Floor applied to "seconds elapsed into the weekly window" before it's used
+/// as the denominator of the run-rate extrapolation. In the first minutes of
+/// a fresh window, dividing by a near-zero elapsed fraction turns any tiny
+/// bit of usage into an absurd projection (thousands of percent) that flaps
+/// wildly on every poll. Flooring the elapsed time at one hour caps that
+/// early multiplier at a sane 168x, so the projected value is always present
+/// and never nonsensical; once an hour has actually passed it's the exact
+/// linear extrapolation with no fudging.
+const MIN_ELAPSED_SECS: i64 = 60 * 60;
 
 /// Why a fetch attempt failed, used to show an accurate message instead of a
 /// single generic "unavailable" string. This matters in practice: the
@@ -141,6 +157,57 @@ pub struct WindowUsage {
     pub resets_label: String,
 }
 
+/// Extrapolated end-of-week weekly utilization: if you keep burning tokens at
+/// the average rate seen so far this weekly window, this is roughly where
+/// utilization lands when the window resets. `projected_pct` can (and, when
+/// you're on pace to blow the limit, will) exceed 100 -- that's the whole
+/// point of showing it, so it is deliberately NOT clamped to 100 the way the
+/// live utilization percentages are.
+#[derive(Clone, Copy)]
+pub struct WeeklyProjection {
+    /// Projected utilization at reset, in percent. May exceed 100 (capped at
+    /// a sane 999 only to avoid an absurd label in the first hour).
+    pub projected_pct: u32,
+    /// True when on pace to exceed the weekly limit (`projected_pct > 100`).
+    pub over_limit: bool,
+}
+
+impl WeeklyProjection {
+    /// "under" / "over" tag for the projection, matching the user's mental
+    /// model of "83% -> underuse, room to spare" vs "123% -> overuse, pace
+    /// down". Kept to a single short word so it fits the tray tooltip line,
+    /// the menu line and the drawn panel bar caption identically.
+    pub fn tag(self) -> &'static str {
+        if self.over_limit { "over" } else { "under" }
+    }
+}
+
+/// Linearly extrapolates end-of-window weekly utilization from the current
+/// utilization and how far through the 7-day window we are. Factored out as a
+/// pure function of its three inputs so the run-rate math can be unit-tested
+/// without a live endpoint or a real clock.
+fn project_weekly(
+    current_pct: u32,
+    seven_day_resets: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> WeeklyProjection {
+    let window_start = seven_day_resets - Duration::seconds(WEEKLY_WINDOW_SECS);
+    // Clamp into `[MIN_ELAPSED_SECS, WEEKLY_WINDOW_SECS]`: the lower bound
+    // tames first-hour noise (see `MIN_ELAPSED_SECS`) and also absorbs the
+    // pathological "now is before the window even started" clock-skew case;
+    // the upper bound means once the window has fully elapsed the projection
+    // just equals the current utilization.
+    let elapsed = (now - window_start)
+        .num_seconds()
+        .clamp(MIN_ELAPSED_SECS, WEEKLY_WINDOW_SECS);
+    let fraction = elapsed as f64 / WEEKLY_WINDOW_SECS as f64;
+    let projected = (current_pct as f64 / fraction).round().clamp(0.0, 999.0) as u32;
+    WeeklyProjection {
+        projected_pct: projected,
+        over_limit: projected > 100,
+    }
+}
+
 /// Leniently converts the raw `extra_usage` JSON (if any) into display-ready
 /// info. Never propagates a parse error to the caller -- an unparseable or
 /// disabled block just means "don't show this line", not "usage data is
@@ -252,6 +319,20 @@ impl TrayState {
         }
     }
 
+    /// Extrapolated end-of-week weekly utilization, when usage data is
+    /// available. `None` in the `Unavailable` state (nothing to project
+    /// from). Used by the tooltip's/menu's/panel's third "projected" element.
+    pub fn weekly_projection(&self) -> Option<WeeklyProjection> {
+        match self {
+            TrayState::Ok {
+                seven_day_pct,
+                seven_day_resets,
+                ..
+            } => Some(project_weekly(*seven_day_pct, *seven_day_resets, Utc::now())),
+            TrayState::Unavailable { .. } => None,
+        }
+    }
+
     /// Short label describing why data is unavailable, when it is. Used by
     /// the floating usage panel (`panel.rs`) so it shows the same accurate
     /// reason as the tray tooltip/menu instead of a generic message.
@@ -260,6 +341,22 @@ impl TrayState {
             TrayState::Unavailable { reason, .. } => Some(reason.short_label()),
             TrayState::Ok { .. } => None,
         }
+    }
+
+    /// Text for the "Projected" at-a-glance menu line -- the run-rate
+    /// extrapolation of where weekly utilization lands at reset. Mirrors the
+    /// tooltip's third line and the panel's third bar. `None` when data is
+    /// unavailable (the caller shows the same short reason on the weekly line
+    /// already, so an extra "projected: unavailable" line would just be
+    /// noise).
+    pub fn projected_menu_line(&self, bar_width: usize) -> Option<String> {
+        let projection = self.weekly_projection()?;
+        Some(format!(
+            "Projected [{}] {}%  ({})",
+            bar(projection.projected_pct, bar_width),
+            projection.projected_pct,
+            projection.tag()
+        ))
     }
 
     /// Text for the third, informational "extra usage / credit balance"
@@ -294,12 +391,15 @@ impl TrayState {
                 ..
             } => {
                 let now = Utc::now();
+                let projection = project_weekly(*seven_day_pct, *seven_day_resets, now);
                 format!(
-                    "Session: {}% (resets in {})\nWeekly: {}% (resets {})",
+                    "Session: {}% (resets in {})\nWeekly: {}% (resets {})\nProjected weekly: {}% of limit ({})",
                     five_hour_pct,
                     format_relative(*five_hour_resets, now),
                     seven_day_pct,
-                    format_weekday_time(*seven_day_resets)
+                    format_weekday_time(*seven_day_resets),
+                    projection.projected_pct,
+                    projection.tag()
                 )
             }
         }
@@ -547,4 +647,79 @@ fn bar(pct: u32, width: usize) -> String {
     let filled = filled.min(width);
     let empty = width - filled;
     format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(empty))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resets_in(secs_from_now: i64, now: DateTime<Utc>) -> DateTime<Utc> {
+        now + Duration::seconds(secs_from_now)
+    }
+
+    #[test]
+    fn projection_scales_current_usage_by_time_remaining() {
+        let now = Utc::now();
+        // Exactly halfway through the week (reset is 3.5 days out), 40% used.
+        // Run-rate says we land at ~80% by reset -> "under".
+        let resets = resets_in(WEEKLY_WINDOW_SECS / 2, now);
+        let p = project_weekly(40, resets, now);
+        assert_eq!(p.projected_pct, 80);
+        assert!(!p.over_limit);
+        assert_eq!(p.tag(), "under");
+    }
+
+    #[test]
+    fn projection_flags_overuse_when_on_pace_to_exceed() {
+        let now = Utc::now();
+        // Halfway through the week but already at 70% -> projects to 140%.
+        let resets = resets_in(WEEKLY_WINDOW_SECS / 2, now);
+        let p = project_weekly(70, resets, now);
+        assert_eq!(p.projected_pct, 140);
+        assert!(p.over_limit);
+        assert_eq!(p.tag(), "over");
+    }
+
+    #[test]
+    fn projection_at_end_of_window_equals_current_usage() {
+        let now = Utc::now();
+        // Reset is imminent (1 second away) -> the window has essentially
+        // fully elapsed, so the projection should just be the current value.
+        let resets = resets_in(1, now);
+        let p = project_weekly(63, resets, now);
+        assert_eq!(p.projected_pct, 63);
+        assert!(!p.over_limit);
+    }
+
+    #[test]
+    fn first_hour_noise_is_capped_not_absurd() {
+        let now = Utc::now();
+        // 5% used only a few minutes into a fresh window. Without the
+        // MIN_ELAPSED_SECS floor this would extrapolate to many thousands of
+        // percent; with it, the denominator is pinned at 1 hour of 168, so
+        // 5% * 168 = 840% -- high (correctly screaming "slow down") but not
+        // nonsensical, and never above the 999 clamp.
+        let resets = resets_in(WEEKLY_WINDOW_SECS - 300, now);
+        let p = project_weekly(5, resets, now);
+        assert_eq!(p.projected_pct, 840);
+        assert!(p.over_limit);
+    }
+
+    #[test]
+    fn projection_is_clamped_to_999() {
+        let now = Utc::now();
+        let resets = resets_in(WEEKLY_WINDOW_SECS - 60, now);
+        let p = project_weekly(100, resets, now);
+        assert_eq!(p.projected_pct, 999);
+    }
+
+    #[test]
+    fn zero_usage_projects_to_zero() {
+        let now = Utc::now();
+        let resets = resets_in(WEEKLY_WINDOW_SECS / 4, now);
+        let p = project_weekly(0, resets, now);
+        assert_eq!(p.projected_pct, 0);
+        assert!(!p.over_limit);
+        assert_eq!(p.tag(), "under");
+    }
 }

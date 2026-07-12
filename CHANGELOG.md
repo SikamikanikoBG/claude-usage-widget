@@ -4,6 +4,32 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0]
+
+### Added
+
+- **Projected weekly utilization.** Alongside the live 5-hour and 7-day
+  percentages, the widget now extrapolates where your weekly usage is *headed*
+  by reset. It measures how far you are through the current 7-day window
+  (derived from the reset timestamp), divides your current utilization by that
+  elapsed fraction, and shows the run-rate result: e.g. `83%` means you're on
+  pace to finish the week comfortably under the limit ("under"), `123%` means
+  you're on pace to blow through it and should slow down ("over"). This is the
+  number to watch when deciding how carefully to spend the days left before
+  reset.
+  - It appears in three places, matching the existing two-window layout:
+    - a **third tooltip line** on hover (`Projected weekly: 83% of limit
+      (under)`),
+    - a **third right-click menu line** (`Projected [███░░░░░░░] 83% (under)`),
+    - a **third progress bar** in the floating usage panel. The panel now
+      resizes to fit: "Both" is three bars tall, "Weekly only" pairs the
+      weekly bar with its projection, and "Rotating" cycles Session → Weekly
+      → Projected.
+  - The projection is deliberately not clamped to 100% (over-limit is the
+    whole point), but the first hour of a fresh window is floored so a tiny
+    early burst can't extrapolate to an absurd, flapping thousands-of-percent
+    figure; once an hour has elapsed it's the exact linear run-rate.
+
 ## [0.4.1]
 
 ### Changed

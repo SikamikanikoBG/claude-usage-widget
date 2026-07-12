@@ -68,8 +68,9 @@ const BAR_WIDTH: usize = 10;
 const NOTIFY_THRESHOLD: u32 = 90;
 
 /// Position (within `tray_menu`) the extra-usage line is inserted at when
-/// it's shown: right after the two core lines, before the separator.
-const EXTRA_USAGE_MENU_POSITION: usize = 2;
+/// it's shown: right after the three core lines (session, weekly, projected),
+/// before the separator.
+const EXTRA_USAGE_MENU_POSITION: usize = 3;
 
 enum UserEvent {
     Menu(MenuEvent),
@@ -132,6 +133,12 @@ fn main() {
     // Menu items that need their text/state updated as usage data comes in.
     let session_item = MenuItem::new("Session  loading...", false, None);
     let weekly_item = MenuItem::new("Weekly   loading...", false, None);
+    // The run-rate projection of where weekly utilization lands at reset --
+    // the third "at a glance" line, mirroring the tooltip's third line and
+    // the panel's third bar. Always present (unlike the optional extra-usage
+    // line), so the weekly reason line above it never gets an orphaned
+    // duplicate when data is unavailable.
+    let projected_item = MenuItem::new("Projected  loading...", false, None);
     // Extra-usage/credit-balance line: created up front but only inserted
     // into the menu (see `extra_item_shown` below) when the account has it
     // enabled, so the common case doesn't show an empty/irrelevant line.
@@ -223,6 +230,7 @@ fn main() {
     let _ = tray_menu.append_items(&[
         &session_item,
         &weekly_item,
+        &projected_item,
         &PredefinedMenuItem::separator(),
         &refresh_item,
         &startup_item,
@@ -283,6 +291,11 @@ fn main() {
                 let (session_text, weekly_text) = state.menu_lines(BAR_WIDTH);
                 session_item.set_text(session_text);
                 weekly_item.set_text(weekly_text);
+                projected_item.set_text(
+                    state
+                        .projected_menu_line(BAR_WIDTH)
+                        .unwrap_or_else(|| "Projected  unavailable".to_string()),
+                );
 
                 panel::update_data(panel_hwnd, &state);
 

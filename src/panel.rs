@@ -31,18 +31,29 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, KillTimer, RegisterClassW, SetTimer,
-    ShowWindow, SystemParametersInfoW, SPI_GETWORKAREA, SW_HIDE, SW_SHOW, WM_ERASEBKGND, WM_PAINT,
-    WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    SetWindowPos, ShowWindow, SystemParametersInfoW, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOZORDER,
+    SW_HIDE, SW_SHOW, WM_ERASEBKGND, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::usage::TrayState;
 
 const CLASS_NAME: &str = "ClaudeUsageWidgetPanel";
 const PANEL_WIDTH: i32 = 260;
-const PANEL_HEIGHT: i32 = 90;
+/// Height of a single "label + progress bar" row. The window's total height
+/// is `rows * ROW_HEIGHT`, sized to the current mode (see `rows_for_mode`) so
+/// each row keeps the same proportions whether one, two or three are shown.
+const ROW_HEIGHT: i32 = 45;
+/// Most rows any mode shows at once (Both: Session + Weekly + Projected).
+/// Used only as the window's initial height at creation, before the real
+/// mode is applied.
+const MAX_ROWS: i32 = 3;
 const CORNER_MARGIN: i32 = 12;
 const ROTATE_TIMER_ID: usize = 1;
 const ROTATE_INTERVAL_MS: u32 = 2000;
+/// Number of distinct single-window views the `Rotating` mode cycles through:
+/// Session, then Weekly, then Projected.
+const ROTATE_VIEWS: u8 = 3;
 
 /// The four display modes selectable from the tray menu's "Usage panel"
 /// submenu.
@@ -76,13 +87,31 @@ impl PanelMode {
             _ => None,
         }
     }
+
+    /// How many bar rows this mode draws at once, so the window can be sized
+    /// to fit them exactly. `Both` shows all three (Session, Weekly,
+    /// Projected); `WeeklyOnly` pairs Weekly with its Projected extrapolation;
+    /// `Rotating` and `FiveHourOnly` show a single row.
+    fn row_count(self) -> i32 {
+        match self {
+            PanelMode::Both => 3,
+            PanelMode::WeeklyOnly => 2,
+            PanelMode::FiveHourOnly => 1,
+            PanelMode::Rotating => 1,
+        }
+    }
 }
 
 #[derive(Clone)]
 struct BarInfo {
+    /// The percentage shown in the label. For the projection bar this may
+    /// exceed 100 (e.g. 123%); the drawn fill is clamped to 100 in
+    /// `draw_bar_row`, the label is not.
     pct: u32,
     color: [u8; 3],
-    resets_label: String,
+    /// Trailing text after the percentage, e.g. `resets Wed 18:00` for a
+    /// usage window or `over` / `under` for the projection.
+    detail: String,
 }
 
 enum PanelData {
@@ -91,6 +120,9 @@ enum PanelData {
     Ok {
         five_hour: BarInfo,
         seven_day: BarInfo,
+        /// Run-rate extrapolation of where weekly utilization lands at reset;
+        /// the third bar, matching the tray tooltip's/menu's third line.
+        projected: BarInfo,
     },
     /// Carries the same short reason label the tray tooltip/menu show (e.g.
     /// "rate-limited, retrying" vs "sign-in needed"), so the panel doesn't
@@ -102,10 +134,11 @@ struct PanelState {
     data: PanelData,
     mode: PanelMode,
     visible: bool,
-    /// Only meaningful in `PanelMode::Rotating`: which of the two bars is
-    /// currently shown; flipped by the `WM_TIMER` handler every
+    /// Only meaningful in `PanelMode::Rotating`: which of the `ROTATE_VIEWS`
+    /// single-window views (0 = Session, 1 = Weekly, 2 = Projected) is
+    /// currently shown; advanced by the `WM_TIMER` handler every
     /// `ROTATE_INTERVAL_MS`.
-    rotate_show_five_hour: bool,
+    rotate_index: u8,
 }
 
 static PANEL_STATE: OnceLock<Mutex<PanelState>> = OnceLock::new();
@@ -116,7 +149,7 @@ fn state() -> &'static Mutex<PanelState> {
             data: PanelData::Loading,
             mode: PanelMode::Both,
             visible: false,
-            rotate_show_five_hour: true,
+            rotate_index: 0,
         })
     })
 }
@@ -154,6 +187,33 @@ fn work_area() -> RECT {
     }
 }
 
+/// Resizes and repositions the panel to fit `mode`'s row count, keeping it
+/// anchored in the bottom-right corner of the work area (above the taskbar).
+/// The window grows/shrinks between one and three rows as the user switches
+/// modes -- e.g. `Both` is now three rows tall to fit the added Projected
+/// bar, while `Rotating` stays a single compact row. A null `hwnd` (window
+/// creation failed) is a no-op, like every other function here.
+fn position_and_size(hwnd: HWND, mode: PanelMode) {
+    if hwnd.is_null() {
+        return;
+    }
+    let height = mode.row_count().max(1) * ROW_HEIGHT;
+    let area = work_area();
+    let x = area.right - PANEL_WIDTH - CORNER_MARGIN;
+    let y = area.bottom - height - CORNER_MARGIN;
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            x,
+            y,
+            PANEL_WIDTH,
+            height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
 /// Enables/disables the rotate timer to match whether the panel is both
 /// visible and in `Rotating` mode, and schedules a repaint either way.
 fn sync_timer(hwnd: HWND) {
@@ -179,7 +239,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: usize, lparam: i
         WM_TIMER => {
             if wparam == ROTATE_TIMER_ID {
                 if let Ok(mut s) = state().lock() {
-                    s.rotate_show_five_hour = !s.rotate_show_five_hour;
+                    s.rotate_index = (s.rotate_index + 1) % ROTATE_VIEWS;
                 }
                 unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
             }
@@ -207,7 +267,7 @@ fn draw_bar_row(hdc: HDC, client: &RECT, top: i32, row_h: i32, label: &str, bar:
     const PAD: i32 = 10;
     const LABEL_H: i32 = 18;
 
-    let label_text = format!("{label}  {}%  resets {}", bar.pct, bar.resets_label);
+    let label_text = format!("{label}  {}%  {}", bar.pct, bar.detail);
     draw_text(hdc, client.left + PAD, top + 4, &label_text, rgb(230, 230, 230));
 
     let bar_rect = RECT {
@@ -277,18 +337,22 @@ fn paint(hwnd: HWND) {
                     rgb(200, 200, 200),
                 );
             }
-            PanelData::Ok { five_hour, seven_day } => {
+            PanelData::Ok { five_hour, seven_day, projected } => {
                 let rows: Vec<(&str, &BarInfo)> = match s.mode {
-                    PanelMode::Both => vec![("Session", five_hour), ("Weekly", seven_day)],
+                    PanelMode::Both => vec![
+                        ("Session", five_hour),
+                        ("Weekly", seven_day),
+                        ("Projected", projected),
+                    ],
                     PanelMode::FiveHourOnly => vec![("Session", five_hour)],
-                    PanelMode::WeeklyOnly => vec![("Weekly", seven_day)],
-                    PanelMode::Rotating => {
-                        if s.rotate_show_five_hour {
-                            vec![("Session", five_hour)]
-                        } else {
-                            vec![("Weekly", seven_day)]
-                        }
+                    PanelMode::WeeklyOnly => {
+                        vec![("Weekly", seven_day), ("Projected", projected)]
                     }
+                    PanelMode::Rotating => match s.rotate_index % ROTATE_VIEWS {
+                        0 => vec![("Session", five_hour)],
+                        1 => vec![("Weekly", seven_day)],
+                        _ => vec![("Projected", projected)],
+                    },
                 };
 
                 let row_count = rows.len().max(1) as i32;
@@ -326,9 +390,13 @@ pub fn create_window() -> HWND {
         // existing registration is reused.
         RegisterClassW(&wnd_class);
 
+        // Initial geometry uses the tallest layout (MAX_ROWS); `set_mode` --
+        // always called right after `create_window` in `main.rs` -- resizes
+        // it to the actually-selected mode via `position_and_size`.
+        let initial_height = MAX_ROWS * ROW_HEIGHT;
         let area = work_area();
         let x = area.right - PANEL_WIDTH - CORNER_MARGIN;
-        let y = area.bottom - PANEL_HEIGHT - CORNER_MARGIN;
+        let y = area.bottom - initial_height - CORNER_MARGIN;
 
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
@@ -338,7 +406,7 @@ pub fn create_window() -> HWND {
             x,
             y,
             PANEL_WIDTH,
-            PANEL_HEIGHT,
+            initial_height,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinstance,
@@ -376,11 +444,14 @@ pub fn set_mode(hwnd: HWND, mode: PanelMode) {
     eprintln!("[claude-usage-widget] panel: set_mode({mode:?}), hwnd_is_null={}", hwnd.is_null());
     if let Ok(mut s) = state().lock() {
         s.mode = mode;
-        s.rotate_show_five_hour = true;
+        s.rotate_index = 0;
     } else {
         eprintln!("[claude-usage-widget] panel: set_mode could not lock state (poisoned mutex?)");
     }
     if !hwnd.is_null() {
+        // Resize to the new mode's row count before syncing the timer/repaint
+        // so the window is already the right height when it next paints.
+        position_and_size(hwnd, mode);
         sync_timer(hwnd);
     }
 }
@@ -390,18 +461,38 @@ pub fn set_mode(hwnd: HWND, mode: PanelMode) {
 /// tray icon/menu, so the panel never needs its own polling.
 pub fn update_data(hwnd: HWND, tray_state: &TrayState) {
     let data = match tray_state.windows() {
-        Some((five_hour, seven_day)) => PanelData::Ok {
-            five_hour: BarInfo {
-                pct: five_hour.pct,
-                color: crate::icon::color_for_pct(five_hour.pct),
-                resets_label: five_hour.resets_label,
-            },
-            seven_day: BarInfo {
-                pct: seven_day.pct,
-                color: crate::icon::color_for_pct(seven_day.pct),
-                resets_label: seven_day.resets_label,
-            },
-        },
+        Some((five_hour, seven_day)) => {
+            // Projection shares the same `Ok` state the windows came from, so
+            // this is always `Some` here; fall back defensively just in case.
+            let projected = tray_state.weekly_projection();
+            let projected_bar = match projected {
+                Some(p) => BarInfo {
+                    pct: p.projected_pct,
+                    // Color by the projected value (clamped for the color
+                    // thresholds), so an over-limit projection reads red.
+                    color: crate::icon::color_for_pct(p.projected_pct.min(100)),
+                    detail: p.tag().to_string(),
+                },
+                None => BarInfo {
+                    pct: 0,
+                    color: crate::icon::color_for_pct(0),
+                    detail: "--".to_string(),
+                },
+            };
+            PanelData::Ok {
+                five_hour: BarInfo {
+                    pct: five_hour.pct,
+                    color: crate::icon::color_for_pct(five_hour.pct),
+                    detail: format!("resets {}", five_hour.resets_label),
+                },
+                seven_day: BarInfo {
+                    pct: seven_day.pct,
+                    color: crate::icon::color_for_pct(seven_day.pct),
+                    detail: format!("resets {}", seven_day.resets_label),
+                },
+                projected: projected_bar,
+            }
+        }
         None => PanelData::Unavailable(tray_state.unavailable_short_label().unwrap_or("unavailable")),
     };
 
