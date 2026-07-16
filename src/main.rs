@@ -6,13 +6,15 @@
 // `api.anthropic.com/api/oauth/usage` endpoint that Claude Code's own
 // statusline uses, with the OAuth token Claude Code already cached locally.
 //
-// No telemetry, no network calls to anything other than api.anthropic.com,
-// no files written other than reading the local credentials file and
+// No telemetry and no network calls to anything other than api.anthropic.com.
+// Locally it reads the credentials file, writes a diagnostic log under
+// `%LOCALAPPDATA%\ClaudeUsageWidget` (see `log.rs`), and touches
 // (optionally) the HKCU Run registry key for the "Start with Windows" toggle
 // and the app's own HKCU settings key for the floating usage panel.
 #![windows_subsystem = "windows"]
 
 mod icon;
+mod log;
 mod notify;
 mod panel;
 mod registry;
@@ -42,6 +44,15 @@ use usage::TrayState;
 // (1 minute) is an explicit hard floor: "no need to spam Anthropic".
 const POLL_INTERVAL_PRESETS_SECS: [(u64, &str); 4] =
     [(60, "1 minute"), (120, "2 minutes"), (300, "5 minutes"), (600, "10 minutes")];
+
+/// Opacity choices offered for the floating panel. A tray app has no settings
+/// window to hang a slider off, so the setting is a short list of presets in
+/// the menu -- the same hand-rolled radio-group pattern the panel-mode and
+/// poll-interval submenus already use. The default (see
+/// `registry::DEFAULT_PANEL_OPACITY_PCT`) is deliberately one of these, so
+/// the submenu always opens with exactly one item ticked.
+const PANEL_OPACITY_PRESETS_PCT: [(u32, &str); 5] =
+    [(30, "30%"), (50, "50%"), (70, "70% (default)"), (85, "85%"), (100, "100%")];
 
 /// Ceiling for the RATE-LIMITED backoff schedule: even after a long streak
 /// of consecutive 429s, never wait longer than this between attempts.
@@ -78,6 +89,12 @@ enum UserEvent {
 }
 
 fn main() {
+    // First thing of all: give the rest of this file's `eprintln!`s somewhere
+    // to go. This binary has no console (`windows_subsystem = "windows"`), so
+    // until this runs every diagnostic in the process is written to an
+    // invalid handle and dropped on the floor.
+    let log_path = log::init();
+
     // Must happen before any tray icon is created or worker thread spawned:
     // if another copy of the widget is already running, exit immediately
     // rather than creating a duplicate tray icon / registry entry.
@@ -88,6 +105,19 @@ fn main() {
             std::process::exit(0);
         }
     };
+
+    // Written after the single-instance check so the log isn't cluttered by
+    // start-up attempts that immediately exit. Marks the boundary between
+    // runs in an appended log file.
+    eprintln!(
+        "[claude-usage-widget] ---- starting v{} on {} ----",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS
+    );
+    match &log_path {
+        Some(path) => eprintln!("[claude-usage-widget] logging to {}", path.display()),
+        None => eprintln!("[claude-usage-widget] no log file (this line goes nowhere)"),
+    }
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
 
@@ -188,6 +218,30 @@ fn main() {
         (panel_mode_weekly.clone(), PanelMode::WeeklyOnly),
         (panel_mode_rotating.clone(), PanelMode::Rotating),
     ];
+    // "Opacity" presets, same hand-rolled radio-group pattern as the mode
+    // items above.
+    let panel_opacity_initial = registry::panel_opacity_pct();
+    let panel_opacity_items: Vec<(CheckMenuItem, u32)> = PANEL_OPACITY_PRESETS_PCT
+        .iter()
+        .map(|&(pct, label)| {
+            (
+                CheckMenuItem::new(label, true, pct == panel_opacity_initial, None),
+                pct,
+            )
+        })
+        .collect();
+    let panel_opacity_entries: Vec<&dyn tray_icon::menu::IsMenuItem> = panel_opacity_items
+        .iter()
+        .map(|(item, _)| item as &dyn tray_icon::menu::IsMenuItem)
+        .collect();
+    let panel_opacity_submenu = Submenu::with_items("Opacity", true, &panel_opacity_entries)
+        .expect("failed to build panel opacity submenu");
+
+    // The escape hatch for the drag feature: if the panel ends up somewhere
+    // awkward (or on a monitor that's since been unplugged), this puts it
+    // back in the bottom-right corner without touching the registry by hand.
+    let panel_reset_pos_item = MenuItem::new("Reset position", true, None);
+
     let panel_submenu = Submenu::with_items(
         "Usage panel",
         true,
@@ -198,6 +252,9 @@ fn main() {
             &panel_mode_five_hour,
             &panel_mode_weekly,
             &panel_mode_rotating,
+            &PredefinedMenuItem::separator(),
+            &panel_opacity_submenu,
+            &panel_reset_pos_item,
         ],
     )
     .expect("failed to build usage panel submenu");
@@ -365,6 +422,13 @@ fn main() {
                     .find(|(item, _)| event.id == item.id())
                 {
                     select_panel_mode(&panel_mode_items, panel_hwnd, *mode);
+                } else if let Some((_, pct)) = panel_opacity_items
+                    .iter()
+                    .find(|(item, _)| event.id == item.id())
+                {
+                    select_panel_opacity(&panel_opacity_items, panel_hwnd, *pct);
+                } else if event.id == panel_reset_pos_item.id() {
+                    panel::reset_position(panel_hwnd);
                 } else if let Some((_, secs)) = poll_interval_items
                     .iter()
                     .find(|(item, _)| event.id == item.id())
@@ -411,6 +475,21 @@ fn select_panel_mode(items: &[(CheckMenuItem, PanelMode)], panel_hwnd: HWND, sel
         eprintln!("[claude-usage-widget] failed to persist usage panel mode: {e}");
     }
     panel::set_mode(panel_hwnd, selected);
+}
+
+/// Enforces mutual exclusion across the "Opacity" preset checkboxes,
+/// persists the choice (clamped to a readable range by
+/// `registry::set_panel_opacity_pct` regardless of what's passed in) and
+/// applies it to the live panel window, so the change is visible while the
+/// menu is still open.
+fn select_panel_opacity(items: &[(CheckMenuItem, u32)], panel_hwnd: HWND, selected_pct: u32) {
+    for (item, pct) in items {
+        item.set_checked(*pct == selected_pct);
+    }
+    if let Err(e) = registry::set_panel_opacity_pct(selected_pct) {
+        eprintln!("[claude-usage-widget] failed to persist usage panel opacity: {e}");
+    }
+    panel::set_opacity(panel_hwnd, selected_pct);
 }
 
 /// Enforces mutual exclusion across the "Poll interval" preset checkboxes,

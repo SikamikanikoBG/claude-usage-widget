@@ -65,12 +65,20 @@ for why).
 
 ### Tooltip
 
-Hovering the icon shows a two-line summary:
+Hovering the icon shows a three-line summary - the live session and weekly
+windows, plus where your weekly usage is projected to land at reset:
 
 ```
-Session: 12% (resets in 3h40m)
-Weekly: 54% (resets Wed 18:00)
+Session 12% 3h40m
+Weekly 54% Wed 18:00
+Projected 71% under
 ```
+
+The wording is terse on purpose. Windows silently truncates tray tooltips at
+63 characters, so every line here is written to fit inside that budget, with
+a test that fails the build if it ever stops fitting. (Before v0.6.0 it
+didn't fit: the tooltip was cut off mid-word and the projected line rendered
+as the single fragment `Pr`.)
 
 ### Right-click menu
 
@@ -81,6 +89,7 @@ The same two numbers as text progress bars, plus controls:
 ```
 Session  [██░░░░░░░░] 12%  resets 3h40m
 Weekly   [█████░░░░░] 54%  resets Wed 18:00
+Projected [███████░░░] 71% (under)
 ---------------------------------------------
 Refresh now
 ✓ Start with Windows
@@ -91,12 +100,13 @@ Quit
 ```
 
 If your account has "extra usage" (pay-as-you-go credits beyond the plan
-limit) enabled, a third informational line shows up right below the two
+limit) enabled, a fourth informational line shows up right below the three
 above:
 
 ```
 Session  [██░░░░░░░░] 12%  resets 3h40m
 Weekly   [█████░░░░░] 54%  resets Wed 18:00
+Projected [███████░░░] 71% (under)
 Extra usage  [██░░░░░░░░] 12%  42.50/850.00 EUR
 ---------------------------------------------
 ...
@@ -110,9 +120,10 @@ is the common case.
   (see [Reliability](#reliability-refresh-backoff-and-why-gray) below), in
   which case it's deliberately ignored until the backoff clears.
 - **Start with Windows** - toggles launching the widget at sign-in.
-- **Usage panel** submenu - a **Show panel** checkbox plus four mutually
-  exclusive display-mode options: **Both**, **5-hour only**, **Weekly only**,
-  **Rotating**. See [Floating usage panel](#floating-usage-panel) below.
+- **Usage panel** submenu - a **Show panel** checkbox, four mutually
+  exclusive display-mode options (**Both**, **5-hour only**, **Weekly only**,
+  **Rotating**), an **Opacity** submenu and **Reset position**. See
+  [Floating usage panel](#floating-usage-panel) below.
 - **Poll interval** submenu - **1 minute**, **2 minutes**, **5 minutes**
   (default), **10 minutes**. Changing it applies immediately, no restart
   needed. 1 minute is a hard floor enforced in code, not just in the list of
@@ -125,13 +136,31 @@ way to force a check outside of the timer.
 
 ### Floating usage panel
 
-An optional always-on-top window, off by default, in the bottom-right corner
-of your primary monitor's work area (above the taskbar, not under it), with
-real drawn progress bars instead of text. Turn it on from the tray menu's
-**Usage panel** submenu, which also lets you pick what it shows: **Both**
-(stacked), **5-hour only**, **Weekly only**, or **Rotating** (alternates
-every 2 seconds). Both the visibility and the chosen mode are remembered
-across restarts.
+An optional always-on-top window, off by default, starting in the
+bottom-right corner of your primary monitor's work area (above the taskbar,
+not under it), with real drawn progress bars instead of text. Turn it on from
+the tray menu's **Usage panel** submenu, which also lets you pick what it
+shows: **Both** (Session + Weekly + Projected, stacked), **5-hour only**,
+**Weekly only** (weekly plus its projection), or **Rotating** (cycles Session
+→ Weekly → Projected every 2 seconds). The panel resizes itself to fit
+whichever mode you pick.
+
+**Move it anywhere.** Drag the panel by clicking anywhere on it - there's no
+title bar, the whole surface is the grab handle. Where you drop it is
+remembered across restarts. If the panel ever ends up somewhere you can't
+reach it (dragged onto a monitor you later unplugged, say), **Reset position**
+in the same submenu puts it back in the default corner - and the widget will
+already have done that for you on start-up if it noticed the saved spot was
+off-screen.
+
+**Opacity.** Choose **30%**, **50%**, **70%** (the default), **85%** or
+**100%** from the **Opacity** submenu. At the default the panel is perfectly
+readable while still letting you see what's underneath it, so it can sit on
+top of your editor without covering anything up. The change applies
+immediately, while the menu is still open.
+
+Visibility, display mode, opacity and position are all remembered across
+restarts.
 
 ### Threshold notification
 
@@ -146,6 +175,23 @@ Only one copy of the widget runs at a time: if you double-click the exe
 while it's already running (or "Start with Windows" launches it and you also
 start it manually), the second copy notices, prints a message, and exits
 immediately instead of creating a duplicate tray icon.
+
+### Log file
+
+The widget writes a plain-text diagnostic log to:
+
+```
+%LOCALAPPDATA%\ClaudeUsageWidget\widget.log
+```
+
+It records one line per successful poll, every backoff decision, and what the
+floating panel did on start-up (where it was placed, whether it actually
+became visible). It rotates to `widget.log.old` once it passes 1 MB, so it
+can't grow without bound.
+
+This is the first place to look if something misbehaves - and the thing to
+attach to a bug report. It contains no tokens and no personal data: just
+percentages, timings and window coordinates.
 
 ## Reliability: refresh, backoff, and "why gray?"
 
@@ -205,9 +251,9 @@ It writes to exactly three registry locations, and nothing else:
   value in it. Written only if you turn on "Start with Windows"; removed
   again if you turn it off.
 - `HKEY_CURRENT_USER\Software\ClaudeUsageWidget` - this widget's own
-  settings key, holding the floating panel's visibility and mode and the
-  configured poll interval. Updated whenever you change those from the tray
-  menu.
+  settings key, holding the floating panel's visibility, mode, opacity and
+  dragged-to position, plus the configured poll interval. Updated whenever
+  you change those from the tray menu or move the panel.
 - `HKEY_CURRENT_USER\Control Panel\NotifyIconSettings` - a key Windows
   itself owns and maintains for every app that has ever registered a tray
   icon. The widget only sets the `IsPromoted` value (a DWORD) on its own

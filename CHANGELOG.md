@@ -4,6 +4,74 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0]
+
+### Added
+
+- **Panel opacity.** The floating usage panel can now be made see-through, so
+  it can sit on top of your editor without covering up what's underneath.
+  Pick **30% / 50% / 70% / 85% / 100%** from the new **Opacity** submenu under
+  **Usage panel**; the default is **70%**. The change applies immediately,
+  while the menu is still open, and is remembered across restarts.
+- **The panel is movable.** Drag it anywhere on screen by clicking anywhere on
+  it — the whole surface is the grab handle, since there's no title bar to
+  grab. Where you drop it is remembered across restarts.
+  - A new **Reset position** item puts it back in the default bottom-right
+    corner.
+  - A saved position is validated against the current screen layout on
+    start-up: if the panel was parked on a monitor that's since been
+    unplugged (or the resolution shrank), it returns to the default corner
+    instead of faithfully restoring itself somewhere you can't see or reach.
+- **A log file**, at `%LOCALAPPDATA%\ClaudeUsageWidget\widget.log`. The widget
+  has always logged its poll heartbeat, backoff decisions and window errors —
+  but it's built as a GUI app, so it has no console, and every one of those
+  lines was being written to an invalid handle and silently discarded in the
+  released binary. All of that diagnostic detail only ever reached people
+  running the exe from a terminal, i.e. not the person actually hitting a bug.
+  Now it goes to a file (rotated at 1 MB), which is the first place to look
+  when something misbehaves and the thing to attach to a bug report. No tokens
+  or personal data — percentages, timings and window coordinates.
+
+### Fixed
+
+- **The tooltip showed `Pr` instead of the projected weekly line.** The
+  three-line tooltip added in 0.5.0 was 101 characters long, and Windows
+  truncates a tray icon's tooltip at **63** — so it was chopped mid-word,
+  leaving the new projection rendered as a bare `Pr`.
+  - The 63-character limit is the *legacy* one. Windows honours 128 for
+    callers that opt into the Shell v5 behaviour by sending a correct `cbSize`
+    and/or `NIM_SETVERSION`; the `tray-icon` crate does neither (it builds
+    `NOTIFYICONDATAW` with `..std::mem::zeroed()`, leaving `cbSize` at 0), so
+    the shell applies the old limit. Nothing warns about this — the crate
+    copies up to 128 characters and the API returns success; the truncation
+    happens silently inside the shell.
+  - Fixed by rewriting all three lines to fit the real budget
+    (`Session 12% 3h40m` / `Weekly 54% Wed 18:00` / `Projected 71% under`),
+    with tests that fail the build if the worst case ever stops fitting.
+  - The **"unavailable" tooltips were over the limit too**, which was worse
+    than cosmetic: the sign-in message got cut mid-word, eating the "run
+    `claude` once to refresh" instruction — the only actionable part of it.
+    All four now fit, instruction intact.
+- **The floating panel never appeared on some Windows 10 machines** while
+  working normally on Windows 11. Windows ignores the show/hide argument of a
+  process's *first* `ShowWindow` call, substituting whatever the launching
+  program put in its `STARTUPINFO` — so whether the panel's first "please
+  show" was honoured or silently swapped for "hide" depended on what started
+  the widget (Explorer, the Run key, a shortcut). The panel now deliberately
+  spends that unpredictable first call on a no-op at creation, and shows
+  itself via `SetWindowPos(HWND_TOPMOST, …, SWP_SHOWWINDOW)`, which isn't
+  subject to the substitution and also re-asserts always-on-top — a panel
+  stuck behind every other window looks exactly like one that never opened.
+- **A repaint storm that could wedge the whole widget.** If `BeginPaint` ever
+  failed, the panel's paint handler returned without the matching `EndPaint`,
+  leaving the update region unvalidated — so Windows would immediately post
+  another `WM_PAINT`, forever, hanging the message loop and taking the tray
+  icon down with it.
+- The panel now repaints correctly when it resizes between display modes
+  (`CS_HREDRAW | CS_VREDRAW`); previously a grown panel could keep showing the
+  previous, shorter layout until something else happened to invalidate it.
+- The panel no longer steals focus from what you're typing in when it appears.
+
 ## [0.5.0]
 
 ### Added

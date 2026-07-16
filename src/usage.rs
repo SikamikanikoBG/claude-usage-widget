@@ -30,6 +30,56 @@ const WEEKLY_WINDOW_SECS: i64 = 7 * 24 * 60 * 60;
 /// linear extrapolation with no fudging.
 const MIN_ELAPSED_SECS: i64 = 60 * 60;
 
+/// Hard budget, in UTF-16 code units, for the whole tray tooltip.
+///
+/// Windows' `NOTIFYICONDATAW::szTip` field is 128 units wide, but the shell
+/// only *honors* 128 for callers that opt into the Shell v5 (Windows 2000+)
+/// behaviour, by sending a correct `cbSize` and/or `NIM_SETVERSION` with
+/// `NOTIFYICON_VERSION_4`. `tray-icon` (0.24.x) does neither -- it builds the
+/// struct with `..std::mem::zeroed()`, leaving `cbSize` at 0, and never calls
+/// `NIM_SETVERSION` -- so we get the *legacy* limit of 64 units including the
+/// terminating NUL, i.e. 63 usable characters.
+///
+/// This was not theoretical: 0.5.0's tooltip was 101 characters, so the shell
+/// chopped it at exactly 63 and the new "Projected" line rendered as the
+/// single word fragment `Pr`. Nothing warned about it -- the crate happily
+/// copies up to 128 units and `Shell_NotifyIconW` returns success; the
+/// truncation happens silently inside the shell.
+///
+/// Since the limit is imposed by a dependency's struct initialisation, we
+/// can't lift it from here; we live inside it instead, and
+/// `tooltip_worst_case_fits_the_shell_limit` fails the build if we stop.
+const TOOLTIP_MAX_CHARS: usize = 63;
+
+/// Last-resort guard so a tooltip can never again be silently mangled by the
+/// shell: anything over budget is truncated *here*, visibly and on a
+/// character boundary, rather than being cut at an arbitrary UTF-16 offset by
+/// Windows. Under normal operation this is a no-op -- the formats in
+/// `tooltip` are sized to fit, and the tests assert that -- so if this ever
+/// actually trims something, that's a bug in the wording, not in this
+/// function.
+fn fit_tooltip(text: String) -> String {
+    if text.encode_utf16().count() <= TOOLTIP_MAX_CHARS {
+        return text;
+    }
+
+    eprintln!(
+        "[claude-usage-widget] tooltip over the {TOOLTIP_MAX_CHARS}-char shell limit, truncating: {text:?}"
+    );
+
+    let mut out = String::new();
+    let mut units = 0usize;
+    for ch in text.chars() {
+        let ch_units = ch.len_utf16();
+        if units + ch_units > TOOLTIP_MAX_CHARS {
+            break;
+        }
+        out.push(ch);
+        units += ch_units;
+    }
+    out
+}
+
 /// Why a fetch attempt failed, used to show an accurate message instead of a
 /// single generic "unavailable" string. This matters in practice: the
 /// original generic message ("sign-in token expired... run `claude` to
@@ -54,21 +104,22 @@ pub enum UnavailableReason {
 }
 
 impl UnavailableReason {
-    /// Short tooltip/menu-line text for this reason. Every variant other
-    /// than `TokenProblem` explicitly says "retrying automatically" so it's
-    /// clear no user action is needed.
-    fn label(self) -> &'static str {
+    /// Tooltip text for this reason, worded to fit inside
+    /// [`TOOLTIP_MAX_CHARS`] once the "Claude usage: " prefix is added.
+    ///
+    /// The wording is deliberately terse: the previous, chattier version of
+    /// this text ("sign-in token expired or unavailable\nRun `claude` once to
+    /// refresh, then this will update.") blew straight past the shell's
+    /// tooltip limit and got truncated mid-word, silently eating the only
+    /// part the user actually needed -- the instruction to run `claude`.
+    /// Every variant other than `TokenProblem` still says it's retrying, so
+    /// it's clear no user action is needed.
+    fn tooltip_label(self) -> &'static str {
         match self {
-            UnavailableReason::TokenProblem => {
-                "sign-in token expired or unavailable\nRun `claude` once to refresh, then this will update."
-            }
-            UnavailableReason::RateLimited => {
-                "rate-limited by Anthropic right now\nThis clears on its own -- retrying automatically."
-            }
-            UnavailableReason::NetworkError => {
-                "network error reaching Anthropic\nRetrying automatically."
-            }
-            UnavailableReason::Other => "temporarily unavailable\nRetrying automatically.",
+            UnavailableReason::TokenProblem => "sign-in needed\nRun `claude` once to refresh.",
+            UnavailableReason::RateLimited => "rate-limited\nClears on its own -- retrying.",
+            UnavailableReason::NetworkError => "network error\nRetrying automatically.",
+            UnavailableReason::Other => "unavailable\nRetrying automatically.",
         }
     }
 
@@ -379,10 +430,18 @@ impl TrayState {
         }
     }
 
-    /// Short (~2 line) tooltip shown on hover.
+    /// Short (3 line) tooltip shown on hover.
+    ///
+    /// Every line here is written to a hard 63-character budget; see
+    /// [`TOOLTIP_MAX_CHARS`] for why that number, and
+    /// `tooltip_worst_case_fits_the_shell_limit` for the test that keeps it
+    /// honest. Changing the wording without re-checking that budget is how
+    /// the "Projected" line got silently eaten in 0.5.0.
     pub fn tooltip(&self) -> String {
-        match self {
-            TrayState::Unavailable { reason, .. } => format!("Claude usage: {}", reason.label()),
+        let text = match self {
+            TrayState::Unavailable { reason, .. } => {
+                format!("Claude usage: {}", reason.tooltip_label())
+            }
             TrayState::Ok {
                 five_hour_pct,
                 five_hour_resets,
@@ -393,7 +452,7 @@ impl TrayState {
                 let now = Utc::now();
                 let projection = project_weekly(*seven_day_pct, *seven_day_resets, now);
                 format!(
-                    "Session: {}% (resets in {})\nWeekly: {}% (resets {})\nProjected weekly: {}% of limit ({})",
+                    "Session {}% {}\nWeekly {}% {}\nProjected {}% {}",
                     five_hour_pct,
                     format_relative(*five_hour_resets, now),
                     seven_day_pct,
@@ -402,7 +461,8 @@ impl TrayState {
                     projection.tag()
                 )
             }
-        }
+        };
+        fit_tooltip(text)
     }
 
     /// Text for the two disabled "at a glance" menu entries: (session, weekly).
@@ -721,5 +781,103 @@ mod tests {
         assert_eq!(p.projected_pct, 0);
         assert!(!p.over_limit);
         assert_eq!(p.tag(), "under");
+    }
+
+    fn utf16_len(s: &str) -> usize {
+        s.encode_utf16().count()
+    }
+
+    /// The widest tooltip the `Ok` state can physically produce: three-digit
+    /// percentages on both windows, a full "4h59m" session countdown, and a
+    /// projection pinned at the 999 clamp.
+    fn worst_case_ok_state() -> TrayState {
+        let now = Utc::now();
+        TrayState::Ok {
+            five_hour_pct: 100,
+            five_hour_resets: now + Duration::minutes(4 * 60 + 59),
+            seven_day_pct: 100,
+            // A weekly window only `MIN_ELAPSED_SECS` old with 100% already
+            // burned extrapolates past the clamp, giving the widest possible
+            // projected value (999).
+            seven_day_resets: now + Duration::seconds(WEEKLY_WINDOW_SECS - MIN_ELAPSED_SECS),
+            extra_usage: None,
+        }
+    }
+
+    /// Regression test for the 0.5.0 "tooltip shows only `Pr`" bug.
+    ///
+    /// Windows silently truncates the tray tooltip at `TOOLTIP_MAX_CHARS`
+    /// (see that constant for the full why), and nothing in the crate, the
+    /// API return value, or the compiler warns about it -- the only symptom
+    /// is a mangled string on screen, which no automated check would have
+    /// caught. So the budget gets asserted here instead.
+    #[test]
+    fn tooltip_worst_case_fits_the_shell_limit() {
+        let tip = worst_case_ok_state().tooltip();
+        assert!(
+            utf16_len(&tip) <= TOOLTIP_MAX_CHARS,
+            "tooltip is {} units, over the {TOOLTIP_MAX_CHARS} limit: {tip:?}",
+            utf16_len(&tip)
+        );
+    }
+
+    /// The whole point of the tooltip fix: the projected line must survive
+    /// intact, not as the `Pr` fragment the shell used to leave behind.
+    #[test]
+    fn tooltip_keeps_the_whole_projected_line() {
+        let tip = worst_case_ok_state().tooltip();
+        assert!(tip.contains("Projected 999%"), "projected line missing: {tip:?}");
+        assert!(tip.contains("Session"), "session line missing: {tip:?}");
+        assert!(tip.contains("Weekly"), "weekly line missing: {tip:?}");
+        // Three lines, none of them empty or half-eaten.
+        assert_eq!(tip.lines().count(), 3, "expected 3 tooltip lines: {tip:?}");
+    }
+
+    /// The `Unavailable` tooltips were over budget too -- `TokenProblem`'s
+    /// wording got cut mid-word, eating the "run `claude`" instruction that
+    /// was the only actionable part of the message.
+    #[test]
+    fn unavailable_tooltips_fit_the_shell_limit() {
+        for reason in [
+            UnavailableReason::TokenProblem,
+            UnavailableReason::RateLimited,
+            UnavailableReason::NetworkError,
+            UnavailableReason::Other,
+        ] {
+            let tip = TrayState::Unavailable {
+                detail: "irrelevant to the tooltip".to_string(),
+                reason,
+            }
+            .tooltip();
+            assert!(
+                utf16_len(&tip) <= TOOLTIP_MAX_CHARS,
+                "{reason:?} tooltip is {} units, over the {TOOLTIP_MAX_CHARS} limit: {tip:?}",
+                utf16_len(&tip)
+            );
+        }
+
+        // The instruction that used to be truncated away must be complete.
+        let tip = TrayState::Unavailable {
+            detail: String::new(),
+            reason: UnavailableReason::TokenProblem,
+        }
+        .tooltip();
+        assert!(tip.contains("Run `claude` once to refresh."), "{tip:?}");
+    }
+
+    #[test]
+    fn fit_tooltip_passes_short_text_through_untouched() {
+        let short = "Session 42% 3h12m".to_string();
+        assert_eq!(fit_tooltip(short.clone()), short);
+    }
+
+    #[test]
+    fn fit_tooltip_truncates_on_a_character_boundary() {
+        // Multi-byte characters must not be split; the guard trims whole
+        // chars, unlike the shell's blind UTF-16 cut.
+        let long = "é".repeat(100);
+        let fitted = fit_tooltip(long);
+        assert_eq!(utf16_len(&fitted), TOOLTIP_MAX_CHARS);
+        assert!(fitted.chars().all(|c| c == 'é'));
     }
 }

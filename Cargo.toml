@@ -1,6 +1,6 @@
 [package]
 name = "claude-usage-widget"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 
 [dependencies]
@@ -20,6 +20,9 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security",
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
+    # SetStdHandle, used by `log.rs` to point this console-less process's
+    # stderr at a real log file.
+    "Win32_System_Console",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",

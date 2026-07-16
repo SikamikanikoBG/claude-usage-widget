@@ -27,6 +27,21 @@ const APP_SETTINGS_KEY_PATH: &str = r"Software\ClaudeUsageWidget";
 const PANEL_VISIBLE_VALUE: &str = "PanelVisible";
 const PANEL_MODE_VALUE: &str = "PanelMode";
 const POLL_INTERVAL_VALUE: &str = "PollIntervalSecs";
+const PANEL_OPACITY_VALUE: &str = "PanelOpacityPct";
+const PANEL_POS_X_VALUE: &str = "PanelPosX";
+const PANEL_POS_Y_VALUE: &str = "PanelPosY";
+
+/// Opacity the floating panel starts at when nothing has been chosen yet:
+/// visible at a glance, but see-through enough to sit over other windows
+/// without hiding what's underneath.
+pub const DEFAULT_PANEL_OPACITY_PCT: u32 = 70;
+
+/// Floor for panel opacity. Below roughly this point the panel is too faint
+/// to read, and -- worse -- a value of 0 would make it completely invisible
+/// while still being "shown", i.e. indistinguishable from the panel being
+/// broken. Enforced here rather than only in the menu so a hand-edited
+/// registry value can't produce an unusable, hard-to-diagnose window.
+pub const MIN_PANEL_OPACITY_PCT: u32 = 20;
 
 /// Hard floor for the poll interval: "no need to spam Anthropic" was an
 /// explicit requirement, not just a sensible default, so this is enforced
@@ -122,6 +137,71 @@ pub fn set_panel_mode_str(mode: &str) -> std::io::Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (key, _disposition) = hkcu.create_subkey(APP_SETTINGS_KEY_PATH)?;
     key.set_value(PANEL_MODE_VALUE, &mode.to_string())
+}
+
+/// The floating panel's opacity in percent, clamped to
+/// `[MIN_PANEL_OPACITY_PCT, 100]` whatever is stored, defaulting to
+/// [`DEFAULT_PANEL_OPACITY_PCT`] when never set.
+pub fn panel_opacity_pct() -> u32 {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    hkcu.open_subkey_with_flags(APP_SETTINGS_KEY_PATH, KEY_READ)
+        .and_then(|key| key.get_value::<u32, _>(PANEL_OPACITY_VALUE))
+        .map(|pct| pct.clamp(MIN_PANEL_OPACITY_PCT, 100))
+        .unwrap_or(DEFAULT_PANEL_OPACITY_PCT)
+}
+
+/// Persists the floating panel's opacity, clamping to the readable range
+/// regardless of what the caller asks for.
+pub fn set_panel_opacity_pct(pct: u32) -> std::io::Result<()> {
+    let pct = pct.clamp(MIN_PANEL_OPACITY_PCT, 100);
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _disposition) = hkcu.create_subkey(APP_SETTINGS_KEY_PATH)?;
+    key.set_value(PANEL_OPACITY_VALUE, &pct)
+}
+
+/// The floating panel's last dragged-to top-left position, or `None` if the
+/// user has never moved it (in which case the panel anchors itself to the
+/// bottom-right corner -- see `panel::panel_origin`).
+///
+/// Coordinates are screen coordinates and are legitimately negative on a
+/// multi-monitor setup where a second display sits left of / above the
+/// primary one. The registry has no signed-DWORD type, so they round-trip
+/// through `u32` bit-for-bit via `as` casts rather than being stored as text.
+pub fn panel_position() -> Option<(i32, i32)> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let key = hkcu
+        .open_subkey_with_flags(APP_SETTINGS_KEY_PATH, KEY_READ)
+        .ok()?;
+    let x = key.get_value::<u32, _>(PANEL_POS_X_VALUE).ok()? as i32;
+    let y = key.get_value::<u32, _>(PANEL_POS_Y_VALUE).ok()? as i32;
+    Some((x, y))
+}
+
+/// Persists the position the user dragged the floating panel to.
+pub fn set_panel_position(x: i32, y: i32) -> std::io::Result<()> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _disposition) = hkcu.create_subkey(APP_SETTINGS_KEY_PATH)?;
+    key.set_value(PANEL_POS_X_VALUE, &(x as u32))?;
+    key.set_value(PANEL_POS_Y_VALUE, &(y as u32))
+}
+
+/// Forgets any dragged-to position, sending the panel back to its default
+/// bottom-right corner. Backs the "Reset position" menu item, which is the
+/// escape hatch if the panel ever ends up somewhere unreachable.
+pub fn clear_panel_position() -> std::io::Result<()> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let Ok(key) = hkcu.open_subkey_with_flags(APP_SETTINGS_KEY_PATH, KEY_WRITE) else {
+        // No settings key at all means there's no saved position to clear.
+        return Ok(());
+    };
+    for value in [PANEL_POS_X_VALUE, PANEL_POS_Y_VALUE] {
+        match key.delete_value(value) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// The poll interval in seconds, clamped to [`MIN_POLL_INTERVAL_SECS`] no

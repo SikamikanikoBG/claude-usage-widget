@@ -30,12 +30,17 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, KillTimer, RegisterClassW, SetTimer,
-    SetWindowPos, ShowWindow, SystemParametersInfoW, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOZORDER,
-    SW_HIDE, SW_SHOW, WM_ERASEBKGND, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, GetClientRect, GetSystemMetrics, GetWindowRect,
+    IsWindowVisible, KillTimer, RegisterClassW, SetLayeredWindowAttributes, SetTimer, SetWindowPos,
+    ShowWindow,
+    SystemParametersInfoW, CS_HREDRAW, CS_VREDRAW, HTCAPTION, HTCLIENT, HWND_TOPMOST, LWA_ALPHA,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETWORKAREA,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
+    SW_SHOWNOACTIVATE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_PAINT,
+    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
+use crate::registry;
 use crate::usage::TrayState;
 
 const CLASS_NAME: &str = "ClaudeUsageWidgetPanel";
@@ -49,6 +54,12 @@ const ROW_HEIGHT: i32 = 45;
 /// mode is applied.
 const MAX_ROWS: i32 = 3;
 const CORNER_MARGIN: i32 = 12;
+/// How much of the panel must remain within the virtual screen for a saved
+/// position to be reused on the next start. Guards the "panel was dragged
+/// onto a second monitor that is no longer connected" case: without this,
+/// the panel would faithfully restore itself to coordinates the user cannot
+/// see or reach, which is indistinguishable from it being broken.
+const MIN_VISIBLE_PX: i32 = 40;
 const ROTATE_TIMER_ID: usize = 1;
 const ROTATE_INTERVAL_MS: u32 = 2000;
 /// Number of distinct single-window views the `Rotating` mode cycles through:
@@ -139,6 +150,12 @@ struct PanelState {
     /// currently shown; advanced by the `WM_TIMER` handler every
     /// `ROTATE_INTERVAL_MS`.
     rotate_index: u8,
+    /// Current opacity, 20-100. Applied via `SetLayeredWindowAttributes`.
+    opacity_pct: u32,
+    /// Where the user last dragged the panel to, or `None` to keep it corner
+    /// anchored. Mirrors `registry::panel_position` -- cached here so the
+    /// resize path doesn't hit the registry on every mode change.
+    custom_pos: Option<(i32, i32)>,
 }
 
 static PANEL_STATE: OnceLock<Mutex<PanelState>> = OnceLock::new();
@@ -150,6 +167,13 @@ fn state() -> &'static Mutex<PanelState> {
             mode: PanelMode::Both,
             visible: false,
             rotate_index: 0,
+            // Unlike `mode`/`visible` (which `main.rs` passes in so it can
+            // also tick the matching menu items), these two are read straight
+            // from the registry: the window needs them at creation time, and
+            // `custom_pos` isn't a menu-driven setting at all -- it's owned by
+            // the drag handler below.
+            opacity_pct: registry::panel_opacity_pct(),
+            custom_pos: registry::panel_position(),
         })
     })
 }
@@ -187,20 +211,73 @@ fn work_area() -> RECT {
     }
 }
 
-/// Resizes and repositions the panel to fit `mode`'s row count, keeping it
-/// anchored in the bottom-right corner of the work area (above the taskbar).
-/// The window grows/shrinks between one and three rows as the user switches
-/// modes -- e.g. `Both` is now three rows tall to fit the added Projected
-/// bar, while `Rotating` stays a single compact row. A null `hwnd` (window
-/// creation failed) is a no-op, like every other function here.
+/// Whether a panel rectangle overlaps the virtual screen (the union of all
+/// monitors) by at least [`MIN_VISIBLE_PX`] on both axes -- i.e. whether the
+/// user could actually see and grab it there.
+fn is_reachable(x: i32, y: i32, width: i32, height: i32) -> bool {
+    unsafe {
+        let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        // A zeroed virtual screen means the metrics call gave us nothing
+        // useful; don't let that alone condemn a saved position.
+        if vw <= 0 || vh <= 0 {
+            return true;
+        }
+        let overlap_x = (x + width).min(vx + vw) - x.max(vx);
+        let overlap_y = (y + height).min(vy + vh) - y.max(vy);
+        overlap_x >= MIN_VISIBLE_PX && overlap_y >= MIN_VISIBLE_PX
+    }
+}
+
+/// The panel's default home: the bottom-right corner of the work area, i.e.
+/// above the taskbar.
+fn default_corner(height: i32) -> (i32, i32) {
+    let area = work_area();
+    (
+        area.right - PANEL_WIDTH - CORNER_MARGIN,
+        area.bottom - height - CORNER_MARGIN,
+    )
+}
+
+/// Resolves a saved position (or the lack of one) to where the panel should
+/// actually sit. Split out from [`panel_origin`] as a plain function of its
+/// inputs so the "unplugged monitor" fallback can be unit tested without
+/// poking the shared state or the registry.
+fn origin_for(saved: Option<(i32, i32)>, height: i32) -> (i32, i32) {
+    match saved {
+        Some((x, y)) if is_reachable(x, y, PANEL_WIDTH, height) => (x, y),
+        Some((x, y)) => {
+            eprintln!(
+                "[claude-usage-widget] panel: saved position ({x},{y}) is off-screen; using the default corner"
+            );
+            default_corner(height)
+        }
+        None => default_corner(height),
+    }
+}
+
+/// Where the panel should sit: wherever the user last dragged it, falling
+/// back to the default corner when it has never been moved -- or when the
+/// saved spot is no longer reachable (e.g. it was parked on a monitor that
+/// has since been unplugged, or the resolution shrank).
+fn panel_origin(height: i32) -> (i32, i32) {
+    let saved = state().lock().ok().and_then(|s| s.custom_pos);
+    origin_for(saved, height)
+}
+
+/// Resizes the panel to fit `mode`'s row count and puts it where
+/// [`panel_origin`] says it belongs. The window grows/shrinks between one and
+/// three rows as the user switches modes -- e.g. `Both` is three rows tall to
+/// fit the Projected bar, while `Rotating` stays a single compact row. A null
+/// `hwnd` (window creation failed) is a no-op, like every other function here.
 fn position_and_size(hwnd: HWND, mode: PanelMode) {
     if hwnd.is_null() {
         return;
     }
     let height = mode.row_count().max(1) * ROW_HEIGHT;
-    let area = work_area();
-    let x = area.right - PANEL_WIDTH - CORNER_MARGIN;
-    let y = area.bottom - height - CORNER_MARGIN;
+    let (x, y) = panel_origin(height);
     unsafe {
         SetWindowPos(
             hwnd,
@@ -211,6 +288,51 @@ fn position_and_size(hwnd: HWND, mode: PanelMode) {
             height,
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
+    }
+}
+
+/// Applies `pct` opacity to the layered panel window.
+///
+/// This is not optional plumbing: a window created with `WS_EX_LAYERED` is
+/// not composited at all until either this or `UpdateLayeredWindow` has been
+/// called once, so skipping it would leave the panel permanently invisible
+/// rather than merely opaque.
+fn apply_opacity(hwnd: HWND, pct: u32) {
+    if hwnd.is_null() {
+        return;
+    }
+    let pct = pct.clamp(registry::MIN_PANEL_OPACITY_PCT, 100);
+    let alpha = ((pct as f32 / 100.0) * 255.0).round().clamp(0.0, 255.0) as u8;
+    unsafe {
+        if SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA) == 0 {
+            eprintln!(
+                "[claude-usage-widget] panel: could not set opacity to {pct}%: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+/// Records the position the user just dragged the panel to, both in memory
+/// and in the registry so it survives a restart.
+fn save_position(hwnd: HWND) {
+    if hwnd.is_null() {
+        return;
+    }
+    let mut rect: RECT = unsafe { std::mem::zeroed() };
+    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+        eprintln!(
+            "[claude-usage-widget] panel: could not read window rect after a drag: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+
+    if let Ok(mut s) = state().lock() {
+        s.custom_pos = Some((rect.left, rect.top));
+    }
+    if let Err(e) = registry::set_panel_position(rect.left, rect.top) {
+        eprintln!("[claude-usage-widget] failed to persist usage panel position: {e}");
     }
 }
 
@@ -236,6 +358,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: usize, lparam: i
         // We repaint the whole client area every time in WM_PAINT, so
         // skip the default background erase to avoid a visible flicker.
         WM_ERASEBKGND => 1,
+        // Makes the whole panel draggable. The window is a borderless
+        // WS_POPUP with no title bar to grab, so we tell the hit test that
+        // every point in the client area *is* the caption: DefWindowProcW
+        // then runs its standard move loop on WM_NCLBUTTONDOWN, giving us
+        // drag-anywhere for free rather than hand-rolling mouse capture and
+        // WM_MOUSEMOVE arithmetic.
+        WM_NCHITTEST => {
+            let hit = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            if hit == HTCLIENT as isize {
+                HTCAPTION as isize
+            } else {
+                hit
+            }
+        }
+        // Claiming HTCAPTION above also opts us into the rest of the
+        // caption's default behaviour -- including "double-click to
+        // maximize/restore". A 260px status panel has no business filling the
+        // screen, and its layout isn't written for it, so swallow the
+        // double-click rather than letting DefWindowProcW act on it.
+        WM_NCLBUTTONDBLCLK => 0,
+        // Fired once when the move loop above finishes. Saving here rather
+        // than on every WM_MOVE means one registry write per drag instead of
+        // one per mouse-move message.
+        WM_EXITSIZEMOVE => {
+            save_position(hwnd);
+            0
+        }
         WM_TIMER => {
             if wparam == ROTATE_TIMER_ID {
                 if let Ok(mut s) = state().lock() {
@@ -305,6 +454,11 @@ fn paint(hwnd: HWND) {
         let mut ps: PAINTSTRUCT = std::mem::zeroed();
         let hdc = BeginPaint(hwnd, &mut ps);
         if hdc.is_null() {
+            // Still pair the EndPaint: bailing out without one leaves the
+            // update region unvalidated, so Windows immediately posts another
+            // WM_PAINT and we spin on it forever, wedging the message loop
+            // (and with it the tray icon) instead of just skipping a frame.
+            EndPaint(hwnd, &ps);
             return;
         }
 
@@ -383,6 +537,12 @@ pub fn create_window() -> HWND {
             lpfnWndProc: Some(wndproc),
             lpszClassName: class_name.as_ptr(),
             hInstance: hinstance,
+            // Repaint the whole window whenever it changes size. The panel
+            // resizes every time the display mode changes (one to three
+            // rows), and without these the newly exposed area isn't added to
+            // the update region, so a grown panel can keep showing the old,
+            // shorter layout until something else happens to invalidate it.
+            style: CS_HREDRAW | CS_VREDRAW,
             ..std::mem::zeroed()
         };
         // Ignore the result: if this class was already registered (should
@@ -394,12 +554,10 @@ pub fn create_window() -> HWND {
         // always called right after `create_window` in `main.rs` -- resizes
         // it to the actually-selected mode via `position_and_size`.
         let initial_height = MAX_ROWS * ROW_HEIGHT;
-        let area = work_area();
-        let x = area.right - PANEL_WIDTH - CORNER_MARGIN;
-        let y = area.bottom - initial_height - CORNER_MARGIN;
+        let (x, y) = panel_origin(initial_height);
 
         let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
             class_name.as_ptr(),
             std::ptr::null(),
             WS_POPUP,
@@ -418,24 +576,124 @@ pub fn create_window() -> HWND {
                 "[claude-usage-widget] could not create usage panel window: {}",
                 std::io::Error::last_os_error()
             );
+            return hwnd;
         }
+
+        // Must happen before the window is ever shown: WS_EX_LAYERED windows
+        // aren't composited until their alpha has been set once.
+        let opacity = state().lock().map(|s| s.opacity_pct).unwrap_or(registry::DEFAULT_PANEL_OPACITY_PCT);
+        apply_opacity(hwnd, opacity);
+
+        // Deliberately burn the process's first ShowWindow call on a no-op
+        // hide. Windows documents that the *first* ShowWindow of a process
+        // ignores the nCmdShow you pass and substitutes the wShowWindow from
+        // the STARTUPINFO its launcher supplied -- so whether our first
+        // "please show" is honoured or silently swapped for SW_HIDE depends
+        // on who started us (Explorer, the Run key, a shortcut, a debugger).
+        // Spending that unpredictable first call here means every later
+        // show/hide means exactly what it says.
+        ShowWindow(hwnd, SW_HIDE);
+
+        eprintln!(
+            "[claude-usage-widget] panel: window created at ({x},{y}) {PANEL_WIDTH}x{initial_height}, opacity {opacity}%"
+        );
 
         hwnd
     }
 }
 
 /// Shows or hides the panel, starting/stopping the rotate timer to match.
+///
+/// Showing goes through `SetWindowPos(HWND_TOPMOST, .., SWP_SHOWWINDOW)`
+/// rather than `ShowWindow` alone. Two reasons, both learned from the panel
+/// failing to appear at all on some Windows 10 machines while working on
+/// Windows 11:
+///
+///  - `SWP_SHOWWINDOW` isn't subject to the first-call nCmdShow substitution
+///    described in `create_window`, so it shows the window even if we somehow
+///    still owe Windows that first call.
+///  - It re-asserts topmost. A `WS_EX_TOPMOST` window can quietly lose that
+///    band (another app forcing itself foreground, an Explorer restart), and
+///    a panel that is technically visible but stuck behind every other window
+///    looks exactly like a panel that never opened.
+///
+/// `SW_SHOWNOACTIVATE` (not `SW_SHOW`) keeps the panel from stealing focus
+/// from whatever you're typing in when it appears.
 pub fn set_visible(hwnd: HWND, visible: bool) {
     if hwnd.is_null() {
+        eprintln!("[claude-usage-widget] panel: set_visible({visible}) ignored, no window");
         return;
     }
     if let Ok(mut s) = state().lock() {
         s.visible = visible;
     }
     unsafe {
-        ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
+        if visible {
+            SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+        } else {
+            ShowWindow(hwnd, SW_HIDE);
+        }
     }
     sync_timer(hwnd);
+    log_visibility(hwnd, visible);
+}
+
+/// Logs where the panel actually ended up after a show/hide, as opposed to
+/// where we asked for it to be.
+///
+/// This exists because "the panel doesn't appear" is otherwise impossible to
+/// diagnose remotely -- created-but-off-screen, created-but-transparent,
+/// never-created and shown-but-behind-everything all look identical from the
+/// outside. With `log.rs` now routing stderr to a file, these lines tell the
+/// difference on a machine we can't attach a debugger to.
+fn log_visibility(hwnd: HWND, requested: bool) {
+    unsafe {
+        let mut rect: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            eprintln!("[claude-usage-widget] panel: visible={requested}, but window rect is unreadable");
+            return;
+        }
+        let actually_visible = IsWindowVisible(hwnd) != 0;
+        eprintln!(
+            "[claude-usage-widget] panel: visible requested={requested} actual={actually_visible} rect=({},{})-({},{})",
+            rect.left, rect.top, rect.right, rect.bottom
+        );
+    }
+}
+
+/// Changes the panel's opacity and repaints. Persisting is the caller's job
+/// (`main.rs`), matching how `set_mode`/`set_visible` are wired.
+pub fn set_opacity(hwnd: HWND, pct: u32) {
+    if let Ok(mut s) = state().lock() {
+        s.opacity_pct = pct;
+    }
+    apply_opacity(hwnd, pct);
+}
+
+/// Forgets the dragged-to position and sends the panel back to its default
+/// bottom-right corner.
+pub fn reset_position(hwnd: HWND) {
+    let mode = {
+        let Ok(mut s) = state().lock() else {
+            return;
+        };
+        s.custom_pos = None;
+        s.mode
+    };
+    if let Err(e) = registry::clear_panel_position() {
+        eprintln!("[claude-usage-widget] failed to clear the saved usage panel position: {e}");
+    }
+    position_and_size(hwnd, mode);
 }
 
 /// Switches the panel's display mode, starting/stopping the rotate timer to
@@ -508,7 +766,6 @@ pub fn update_data(hwnd: HWND, tray_state: &TrayState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 
     #[test]
     fn panel_mode_registry_round_trips() {
@@ -531,6 +788,54 @@ mod tests {
         assert!(area.bottom > area.top);
     }
 
+    /// Height of the tallest layout, used by the position tests below.
+    fn full_height() -> i32 {
+        MAX_ROWS * ROW_HEIGHT
+    }
+
+    #[test]
+    fn the_default_corner_is_reachable() {
+        let (x, y) = default_corner(full_height());
+        assert!(is_reachable(x, y, PANEL_WIDTH, full_height()));
+    }
+
+    #[test]
+    fn no_saved_position_uses_the_default_corner() {
+        assert_eq!(origin_for(None, full_height()), default_corner(full_height()));
+    }
+
+    #[test]
+    fn a_reachable_saved_position_is_honored() {
+        // Near the top-left of the primary monitor: on-screen on any machine
+        // this test can plausibly run on.
+        assert_eq!(origin_for(Some((100, 100)), full_height()), (100, 100));
+    }
+
+    /// The panel must not restore itself to coordinates the user can't see or
+    /// grab -- e.g. it was dragged onto a second monitor that has since been
+    /// unplugged. That would be indistinguishable from the panel being broken.
+    #[test]
+    fn an_unreachable_saved_position_falls_back_to_the_corner() {
+        let far_away = Some((-30_000, -30_000));
+        assert_eq!(
+            origin_for(far_away, full_height()),
+            default_corner(full_height())
+        );
+        assert!(!is_reachable(-30_000, -30_000, PANEL_WIDTH, full_height()));
+    }
+
+    /// A position only barely peeking onto the screen is treated as
+    /// unreachable: there'd be nothing left to grab and drag back.
+    #[test]
+    fn a_barely_visible_saved_position_falls_back_to_the_corner() {
+        let area = work_area();
+        let sliver = Some((area.right - (MIN_VISIBLE_PX / 2), 100));
+        assert_eq!(
+            origin_for(sliver, full_height()),
+            default_corner(full_height())
+        );
+    }
+
     /// End-to-end smoke test of the actual window: creates the real Win32
     /// window, drives it through hidden -> visible -> hidden and through all
     /// four display modes (including `Rotating`, which starts/stops a real
@@ -548,6 +853,22 @@ mod tests {
 
         set_visible(hwnd, true);
         assert_ne!(unsafe { IsWindowVisible(hwnd) }, 0);
+
+        // The window must really carry WS_EX_LAYERED: without it this call
+        // fails, `apply_opacity` only logs, and the opacity setting would
+        // silently do nothing. Assert against the live window rather than
+        // trusting the style flags we passed to CreateWindowExW.
+        assert_ne!(
+            unsafe { SetLayeredWindowAttributes(hwnd, 0, 178, LWA_ALPHA) },
+            0,
+            "panel window is not layered, so opacity cannot work: {}",
+            std::io::Error::last_os_error()
+        );
+
+        for pct in [30, 70, 100] {
+            set_opacity(hwnd, pct);
+            assert_eq!(state().lock().unwrap().opacity_pct, pct);
+        }
 
         for mode in [
             PanelMode::Both,
