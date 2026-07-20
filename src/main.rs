@@ -350,7 +350,7 @@ fn main() {
 
         match event {
             Event::NewEvents(StartCause::Init) => {
-                let icon = icon::render(icon::GRAY, None);
+                let icon = icon::render(icon::GRAY, None, icon::BadgeShape::Circle);
                 tray_icon = Some(
                     TrayIconBuilder::new()
                         .with_icon(icon)
@@ -386,6 +386,7 @@ fn main() {
                     let _ = tray.set_icon(Some(icon::render(
                         icon::color_for(&state),
                         state.max_utilization(),
+                        icon::BadgeShape::Circle,
                     )));
                     let _ = tray.set_tooltip(Some(state.tooltip()));
                 }
@@ -550,14 +551,19 @@ fn apply_temp_to_tray(tray: &tray_icon::TrayIcon, celsius: Option<u32>) {
 }
 
 /// The temperature icon itself: the number in degrees Celsius over a
-/// threshold color, or -- when there's no reading -- the same plain gray,
-/// digitless circle the usage icon uses for "unavailable", so the two icons
-/// fail in a visually consistent way instead of this one inventing its own
-/// idea of what missing data looks like.
+/// threshold color, or -- when there's no reading -- a plain gray, digitless
+/// badge, matching how the usage icon signals "unavailable" rather than
+/// inventing a second idea of what missing data looks like.
+///
+/// Always the square badge, including in the unavailable case: the shape is
+/// what identifies which icon is which, so it has to stay constant even when
+/// the number doesn't. A gray circle and a gray square are still tellable
+/// apart; two gray circles would not be.
 fn temp_icon(celsius: Option<u32>) -> tray_icon::Icon {
+    let shape = icon::BadgeShape::RoundedSquare;
     match celsius {
-        Some(c) => icon::render(icon::color_for_temp_c(c), Some(c)),
-        None => icon::render(icon::GRAY, None),
+        Some(c) => icon::render(icon::color_for_temp_c(c), Some(c), shape),
+        None => icon::render(icon::GRAY, None, shape),
     }
 }
 

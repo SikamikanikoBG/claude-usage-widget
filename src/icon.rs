@@ -39,11 +39,41 @@ pub const GRAY: [u8; 3] = [142, 142, 147];
 // as it always has.
 const SIZE: u32 = 96;
 
+/// Which silhouette a badge is drawn as.
+///
+/// The two tray icons have to be tellable apart at a glance, and colour can't
+/// do it -- both use the same green/amber/red scale, so a green circle next to
+/// a green circle is exactly the confusing case. Shape is the one channel
+/// that stays readable at 16 physical pixels and doesn't collide with the
+/// status colour: the round badge is Claude usage, the square one is CPU
+/// temperature.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BadgeShape {
+    /// Claude usage. The original badge; unchanged so the app's existing
+    /// icon doesn't shift identity under people who already know it.
+    Circle,
+    /// CPU temperature.
+    RoundedSquare,
+}
+
 /// Radius of the filled badge circle on the `SIZE` canvas.
 const BADGE_RADIUS: f32 = SIZE as f32 / 2.0 - 2.0;
 
-/// The radius digits must stay within. Slightly inside [`BADGE_RADIUS`] so a
-/// digit never runs right up against the circle's anti-aliased edge.
+/// Half-extent of the square badge, matching the circle's radius so both
+/// icons occupy the same footprint in the tray and neither looks larger than
+/// the other.
+const SQUARE_HALF: f32 = SIZE as f32 / 2.0 - 2.0;
+
+/// Corner rounding on the square badge. Enough to read as deliberately
+/// rounded (in the same family as the circle, rather than a hard-edged box
+/// that looks like a different app's icon), but not so much that it starts
+/// reading as a circle again at tray size -- which would defeat the whole
+/// point of using shape as the distinguishing signal.
+const SQUARE_CORNER_RADIUS: f32 = 21.0;
+
+/// The radius digits must stay within on a *circular* badge. Slightly inside
+/// [`BADGE_RADIUS`] so a digit never runs right up against the circle's
+/// anti-aliased edge.
 ///
 /// This constraint exists because of a real, screenshot-confirmed rendering
 /// bug: the digit boxes were originally sized to fit the square *canvas*,
@@ -111,8 +141,8 @@ pub fn color_for_temp_c(celsius: u32) -> [u8; 3] {
 /// with `pct` (when present) drawn as centered digit text on top, and wraps
 /// it as a `tray_icon::Icon`. `pct` is `None` for the "unavailable" state,
 /// which keeps today's plain-color-no-digits look rather than guessing.
-pub fn render(color: [u8; 3], pct: Option<u32>) -> tray_icon::Icon {
-    let rgba = build_rgba(color, pct);
+pub fn render(color: [u8; 3], pct: Option<u32>, shape: BadgeShape) -> tray_icon::Icon {
+    let rgba = build_rgba(color, pct, shape);
     tray_icon::Icon::from_rgba(rgba, SIZE, SIZE).expect("icon buffer has valid dimensions")
 }
 
@@ -120,21 +150,34 @@ pub fn render(color: [u8; 3], pct: Option<u32>) -> tray_icon::Icon {
 /// can inspect the raw RGBA bytes directly (`tray_icon::Icon` doesn't expose
 /// its buffer back out) rather than only being able to build an opaque
 /// platform icon handle.
-fn build_rgba(color: [u8; 3], pct: Option<u32>) -> Vec<u8> {
+fn build_rgba(color: [u8; 3], pct: Option<u32>, shape: BadgeShape) -> Vec<u8> {
     let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
 
-    let center = (SIZE as f32 - 1.0) / 2.0;
-    let radius = BADGE_RADIUS;
+    let center = SIZE as f32 / 2.0;
 
     for y in 0..SIZE {
         for x in 0..SIZE {
-            let dx = x as f32 - center;
-            let dy = y as f32 - center;
-            let dist = (dx * dx + dy * dy).sqrt();
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
 
-            // One-pixel anti-aliased edge so the circle doesn't look jagged
-            // at the small sizes Windows renders tray icons at.
-            let coverage = (radius + 0.5 - dist).clamp(0.0, 1.0);
+            // Both shapes get a one-pixel anti-aliased edge, so neither looks
+            // jagged at the small sizes Windows renders tray icons at.
+            let coverage = match shape {
+                BadgeShape::Circle => {
+                    let dx = px - center;
+                    let dy = py - center;
+                    (BADGE_RADIUS + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0)
+                }
+                BadgeShape::RoundedSquare => rounded_rect_coverage(
+                    px,
+                    py,
+                    center,
+                    center,
+                    SQUARE_HALF,
+                    SQUARE_HALF,
+                    SQUARE_CORNER_RADIUS,
+                ),
+            };
             if coverage <= 0.0 {
                 continue;
             }
@@ -148,7 +191,7 @@ fn build_rgba(color: [u8; 3], pct: Option<u32>) -> Vec<u8> {
     }
 
     if let Some(pct) = pct {
-        draw_percentage(&mut rgba, pct, color);
+        draw_percentage(&mut rgba, pct, color, shape);
     }
 
     rgba
@@ -214,11 +257,59 @@ fn digits_of(pct: u32) -> Vec<u8> {
 /// numbers are meaningfully smaller than the pre-fix values, and legibility
 /// went *up*, because none of the strokes are being silently cut off any
 /// more.
-fn digit_box_for_count(len: usize) -> (i32, i32, i32) {
-    match len {
-        1 => (46, 70, 0),
-        2 => (30, 56, 6),
-        _ => (20, 52, 3),
+fn digit_box_for_count(shape: BadgeShape, len: usize) -> (i32, i32, i32) {
+    match shape {
+        BadgeShape::Circle => match len {
+            1 => (46, 70, 0),
+            2 => (30, 56, 6),
+            _ => (20, 52, 3),
+        },
+        // A square has meaningfully more usable area than the circle
+        // inscribed in it, especially out toward the corners where a
+        // multi-digit block actually needs the room -- so the square badge
+        // isn't just a different silhouette, it also gets to render its
+        // digits noticeably larger for the same tray footprint. That matters
+        // here because the square is the temperature badge, and a
+        // temperature is essentially always two digits.
+        // Sized for a similar optical margin to the circle's rather than for
+        // the maximum that geometrically fits: filling the square edge to
+        // edge measured fine and looked cramped and heavy next to the round
+        // badge, which reads as a rendering glitch rather than a deliberate
+        // pair. Still larger than the circle's boxes at every digit count.
+        BadgeShape::RoundedSquare => match len {
+            1 => (50, 74, 0),
+            2 => (34, 58, 6),
+            _ => (24, 54, 3),
+        },
+    }
+}
+
+/// Whether a digit block of `total_w` x `h`, centered, fits inside `shape`.
+///
+/// Shared by the render-time `debug_assert!` and the unit test so the two can
+/// never disagree about what "fits" means. For the circle it's the corner's
+/// distance from the center against the safe radius; for the rounded square
+/// it's the corner against the box, with the extra check that a corner poking
+/// into the *rounded* part of a corner is still inside the arc.
+fn digit_block_fits(shape: BadgeShape, total_w: i32, h: i32) -> bool {
+    let half_w = total_w as f32 / 2.0;
+    let half_h = h as f32 / 2.0;
+
+    match shape {
+        BadgeShape::Circle => half_w.hypot(half_h) <= DIGIT_SAFE_RADIUS,
+        BadgeShape::RoundedSquare => {
+            let limit = SQUARE_HALF - 1.0; // keep off the anti-aliased edge
+            if half_w > limit || half_h > limit {
+                return false;
+            }
+            // Inside the straight edges: only the rounded corners can still
+            // clip the block, and only if the block extends past where the
+            // rounding starts on BOTH axes at once.
+            let straight = limit - SQUARE_CORNER_RADIUS;
+            let over_x = (half_w - straight).max(0.0);
+            let over_y = (half_h - straight).max(0.0);
+            over_x.hypot(over_y) <= SQUARE_CORNER_RADIUS
+        }
     }
 }
 
@@ -331,9 +422,9 @@ fn draw_seven_segment_digit(rgba: &mut [u8], x0: i32, y0: i32, w: i32, h: i32, d
 /// Draws the percentage as 1-3 bold seven-segment digits, centered, in a
 /// single flat color chosen to contrast with `bg` (the badge color the icon
 /// was already filled with).
-fn draw_percentage(rgba: &mut [u8], pct: u32, bg: [u8; 3]) {
+fn draw_percentage(rgba: &mut [u8], pct: u32, bg: [u8; 3], shape: BadgeShape) {
     let digits = digits_of(pct);
-    let (digit_w, digit_h, gap) = digit_box_for_count(digits.len());
+    let (digit_w, digit_h, gap) = digit_box_for_count(shape, digits.len());
     let total_w = digits.len() as i32 * digit_w + (digits.len() as i32 - 1) * gap;
 
     // Belt-and-braces companion to the unit test of the same invariant: this
@@ -341,9 +432,8 @@ fn draw_percentage(rgba: &mut [u8], pct: u32, bg: [u8; 3]) {
     // counts a future change might introduce without remembering to extend
     // the test's 1..=3 loop.
     debug_assert!(
-        ((total_w as f32 / 2.0).powi(2) + (digit_h as f32 / 2.0).powi(2)).sqrt()
-            <= DIGIT_SAFE_RADIUS,
-        "digit block {total_w}x{digit_h} would extend outside the badge circle"
+        digit_block_fits(shape, total_w, digit_h),
+        "digit block {total_w}x{digit_h} would extend outside the {shape:?} badge"
     );
 
     let start_x = (SIZE as i32 - total_w) / 2;
@@ -375,7 +465,9 @@ mod tests {
         // A CPU reading 100 C+ is exactly when the icon matters most, and it
         // is the one case that takes the 3-digit layout branch. `digits_of`
         // clamps at 999, so nothing above can overflow the digit boxes.
-        let rgba = build_rgba(RED, Some(101));
+        // Checked on the square badge specifically: that's the one that
+        // actually shows temperatures.
+        let rgba = build_rgba(RED, Some(101), BadgeShape::RoundedSquare);
         assert_eq!(rgba.len(), (SIZE * SIZE * 4) as usize);
     }
 
@@ -385,11 +477,16 @@ mod tests {
         // count, the total width must actually fit on the SIZE x SIZE
         // canvas (with room to spare for centering), or digits would get
         // clipped at the edges instead of just looking small.
-        for len in 1..=3usize {
-            let (w, h, gap) = digit_box_for_count(len);
-            let total_w = len as i32 * w + (len as i32 - 1) * gap;
-            assert!(total_w <= SIZE as i32, "{len}-digit total width {total_w} exceeds canvas {SIZE}");
-            assert!(h <= SIZE as i32, "{len}-digit height {h} exceeds canvas {SIZE}");
+        for shape in [BadgeShape::Circle, BadgeShape::RoundedSquare] {
+            for len in 1..=3usize {
+                let (w, h, gap) = digit_box_for_count(shape, len);
+                let total_w = len as i32 * w + (len as i32 - 1) * gap;
+                assert!(
+                    total_w <= SIZE as i32,
+                    "{shape:?} {len}-digit total width {total_w} exceeds canvas {SIZE}"
+                );
+                assert!(h <= SIZE as i32, "{shape:?} {len}-digit height {h} exceeds canvas {SIZE}");
+            }
         }
     }
 
@@ -401,18 +498,58 @@ mod tests {
         // than fitting the circle drawn on it. The corners of the digit
         // block are the furthest points from the center, so they are what
         // has to be inside the radius.
+        for shape in [BadgeShape::Circle, BadgeShape::RoundedSquare] {
+            for len in 1..=3usize {
+                let (w, h, gap) = digit_box_for_count(shape, len);
+                let total_w = len as i32 * w + (len as i32 - 1) * gap;
+                assert!(
+                    digit_block_fits(shape, total_w, h),
+                    "{shape:?} {len}-digit block ({total_w}x{h}) extends outside the badge -- \
+                     its corners would be drawn onto transparent background and disappear \
+                     against a dark taskbar"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_square_badge_fits_larger_digits_than_the_circle() {
+        // Not just decoration: the whole reason the temperature badge is the
+        // square one is that a temperature is always two digits, and a square
+        // has more room for them than the circle inscribed in it. If a change
+        // ever made the square's digits the smaller of the two, the shapes
+        // would be assigned backwards.
         for len in 1..=3usize {
-            let (w, h, gap) = digit_box_for_count(len);
-            let total_w = len as i32 * w + (len as i32 - 1) * gap;
-            let half_diagonal = ((total_w as f32 / 2.0).powi(2) + (h as f32 / 2.0).powi(2)).sqrt();
+            let (cw, ch, _) = digit_box_for_count(BadgeShape::Circle, len);
+            let (sw, sh, _) = digit_box_for_count(BadgeShape::RoundedSquare, len);
             assert!(
-                half_diagonal <= DIGIT_SAFE_RADIUS,
-                "{len}-digit block ({total_w}x{h}) has corner distance {half_diagonal:.1}, \
-                 outside the safe radius {DIGIT_SAFE_RADIUS:.1} -- its corners would be \
-                 drawn outside the badge circle onto transparent background and disappear \
-                 against a dark taskbar"
+                sw > cw && sh > ch,
+                "square {len}-digit box ({sw}x{sh}) should be larger than the circle's ({cw}x{ch})"
             );
         }
+    }
+
+    #[test]
+    fn the_two_badges_are_actually_distinguishable() {
+        // The point of the whole shape change is that the two tray icons can
+        // be told apart. The corners are where they differ: a circle leaves
+        // them transparent, a rounded square fills them. If some future
+        // corner-radius tweak rounded the square until it matched the circle,
+        // this catches it -- whereas every other test here would still pass.
+        let circle = build_rgba(GREEN, Some(42), BadgeShape::Circle);
+        let square = build_rgba(GREEN, Some(42), BadgeShape::RoundedSquare);
+
+        // A point diagonally out toward a corner, outside the circle's radius
+        // but inside the square's rounded corner.
+        let (x, y) = (14u32, 14u32);
+        let alpha_at = |buf: &[u8]| buf[(((y * SIZE) + x) * 4 + 3) as usize];
+
+        assert_eq!(alpha_at(&circle), 0, "circle badge should not fill its corners");
+        assert!(
+            alpha_at(&square) > 200,
+            "square badge should fill its corners (got alpha {})",
+            alpha_at(&square)
+        );
     }
 
     #[test]
@@ -425,15 +562,23 @@ mod tests {
         // legible digit shape. Mirrors the real layout math in
         // `draw_seven_segment_digit` exactly (including the gap inset),
         // not just an approximation of it.
-        for len in 1..=3usize {
-            let (w, h, _spacing) = digit_box_for_count(len);
-            let t = (w / 4).max(5);
-            let gap = (t / 4).max(1);
-            let mid_y = h / 2 - t / 2;
-            let upper_h = mid_y - t - gap;
-            let lower_h = (h - t) - (mid_y + t) - gap;
-            assert!(upper_h > 0, "{len}-digit upper vertical segment has non-positive height");
-            assert!(lower_h > 0, "{len}-digit lower vertical segment has non-positive height");
+        for shape in [BadgeShape::Circle, BadgeShape::RoundedSquare] {
+            for len in 1..=3usize {
+                let (w, h, _spacing) = digit_box_for_count(shape, len);
+                let t = (w / 4).max(5);
+                let gap = (t / 4).max(1);
+                let mid_y = h / 2 - t / 2;
+                let upper_h = mid_y - t - gap;
+                let lower_h = (h - t) - (mid_y + t) - gap;
+                assert!(
+                    upper_h > 0,
+                    "{shape:?} {len}-digit upper vertical segment has non-positive height"
+                );
+                assert!(
+                    lower_h > 0,
+                    "{shape:?} {len}-digit lower vertical segment has non-positive height"
+                );
+            }
         }
     }
 
@@ -446,16 +591,18 @@ mod tests {
         let dir = std::env::temp_dir().join("claude-usage-widget-icon-previews");
         let _ = std::fs::create_dir_all(&dir);
 
-        let cases: [(&str, [u8; 3], u32); 5] = [
-            ("amber_42", AMBER, 42),
-            ("red_87", RED, 87),
-            ("green_7", GREEN, 7),
-            ("amber_100", AMBER, 100),
-            ("red_5", RED, 5),
+        let cases: [(&str, [u8; 3], u32, BadgeShape); 7] = [
+            ("usage_amber_42", AMBER, 42, BadgeShape::Circle),
+            ("usage_red_87", RED, 87, BadgeShape::Circle),
+            ("usage_green_7", GREEN, 7, BadgeShape::Circle),
+            ("usage_amber_100", AMBER, 100, BadgeShape::Circle),
+            ("usage_red_5", RED, 5, BadgeShape::Circle),
+            ("temp_green_62", GREEN, 62, BadgeShape::RoundedSquare),
+            ("temp_red_91", RED, 91, BadgeShape::RoundedSquare),
         ];
 
-        for (name, color, pct) in cases {
-            let rgba = build_rgba(color, Some(pct));
+        for (name, color, pct, shape) in cases {
+            let rgba = build_rgba(color, Some(pct), shape);
             let path = dir.join(format!("{name}.rgba"));
             let mut bytes = Vec::with_capacity(rgba.len() + 8);
             bytes.extend_from_slice(&SIZE.to_le_bytes());

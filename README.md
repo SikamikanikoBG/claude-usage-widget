@@ -44,8 +44,10 @@ to expect on first run.
 
 ![Tray icon in context, next to the other notification-area icons](docs/tray-icon.png)
 
-A small filled circle, color-coded by your highest current utilization
-across both windows, with that percentage drawn directly on the icon as
+A small filled circle - round, to distinguish it from the square
+[CPU temperature badge](#cpu-temperature-icon) - color-coded by your highest
+current utilization across both windows, with that percentage drawn directly
+on the icon as
 bold, rounded, anti-aliased seven-segment digits (like a digital clock) - no
 hovering needed to read the number:
 
@@ -65,16 +67,26 @@ for why).
 
 ### CPU temperature icon
 
-![The two tray icons side by side: CPU temperature at 62 °C, usage at 42%](docs/cpu-temp-icon.png)
+![The two tray icons side by side: the square CPU temperature badge at 60 °C, and the round usage badge at 46%](docs/cpu-temp-icon.png)
 
 A second tray icon sits next to the usage one showing the current CPU
-temperature in degrees Celsius, in the same circular badge style:
+temperature in degrees Celsius.
+
+**The two icons are different shapes so you can tell them apart at a glance:
+usage is the round badge, CPU temperature is the square one.** Colour can't
+do that job, since both use the same green/amber/red scale - a green circle
+next to a green circle tells you nothing about which is which. Shape is the
+one channel that survives at 16 physical pixels without colliding with the
+status colour.
+
+The temperature badge uses the same colour scale, against temperature
+thresholds rather than percentages:
 
 - **Green**: under 70 °C
 - **Amber**: 70-84 °C
 - **Red**: 85 °C and above
 - **Gray, no digits**: this machine exposes no usable thermal sensor, or the
-  last sample failed
+  last sample failed (it stays square, so it's still identifiable)
 
 It refreshes every 5 seconds. Unlike the usage poll there's nothing to
 configure and no reason to slow it down - it reads a local Windows

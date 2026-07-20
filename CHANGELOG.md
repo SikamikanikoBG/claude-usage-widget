@@ -15,6 +15,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   window, but a tray icon is a number that's just always on screen. (The usage
   icon can't share it — there's no legible way to fit two numbers into 16
   physical pixels.)
+  - **The two icons are different shapes: usage stays round, temperature is
+    square.** They share the green/amber/red scale, so colour can't tell them
+    apart — two green circles side by side are ambiguous exactly when you're
+    trying to read them quickly. Shape is the one channel that still works at
+    16 physical pixels. The temperature badge keeps its square outline even in
+    the gray "unavailable" state, so it stays identifiable when the number
+    isn't there.
   - Toggle it with **Show CPU temperature** in the right-click menu. It's on
     by default and the choice is remembered across restarts.
   - No administrator rights needed. The usual way to read CPU temperature on
