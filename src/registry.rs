@@ -30,6 +30,7 @@ const POLL_INTERVAL_VALUE: &str = "PollIntervalSecs";
 const PANEL_OPACITY_VALUE: &str = "PanelOpacityPct";
 const PANEL_POS_X_VALUE: &str = "PanelPosX";
 const PANEL_POS_Y_VALUE: &str = "PanelPosY";
+const CPU_TEMP_VISIBLE_VALUE: &str = "CpuTempVisible";
 
 /// Opacity the floating panel starts at when nothing has been chosen yet:
 /// visible at a glance, but see-through enough to sit over other windows
@@ -120,6 +121,30 @@ pub fn set_panel_visible(visible: bool) -> std::io::Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (key, _disposition) = hkcu.create_subkey(APP_SETTINGS_KEY_PATH)?;
     key.set_value(PANEL_VISIBLE_VALUE, &(visible as u32))
+}
+
+/// Whether the second, CPU-temperature tray icon should be shown.
+///
+/// Defaults to `true` when never set, which is the opposite of
+/// [`is_panel_visible`]'s default and deliberately so: the panel is a
+/// separate floating window that first run should not pop up unasked, while
+/// this is just a tray icon -- the thing a tray app is for -- and defaulting
+/// it off would mean the feature is invisible until someone goes looking for
+/// it in a menu. It is still one click to turn off, and turning it off is
+/// persisted, so nobody is stuck with it.
+pub fn is_cpu_temp_visible() -> bool {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    hkcu.open_subkey_with_flags(APP_SETTINGS_KEY_PATH, KEY_READ)
+        .and_then(|key| key.get_value::<u32, _>(CPU_TEMP_VISIBLE_VALUE))
+        .map(|v| v != 0)
+        .unwrap_or(true)
+}
+
+/// Persists the CPU-temperature tray icon's shown/hidden state.
+pub fn set_cpu_temp_visible(visible: bool) -> std::io::Result<()> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _disposition) = hkcu.create_subkey(APP_SETTINGS_KEY_PATH)?;
+    key.set_value(CPU_TEMP_VISIBLE_VALUE, &(visible as u32))
 }
 
 /// The raw persisted panel display-mode string (see
@@ -247,19 +272,29 @@ enum PromoteOutcome {
 /// overflow area until it re-reads this key (e.g. on the icon's next
 /// register, or on an Explorer restart) on some Windows builds; that's a
 /// Windows-side timing quirk, not a bug in this logic.
-pub fn promote_tray_icon_async() {
-    std::thread::spawn(|| {
+///
+/// `expected_icons` is how many notification icons this process registers
+/// (1, or 2 when the CPU-temperature icon is enabled). It matters because
+/// Windows keeps one `NotifyIconSettings` subkey per icon, all sharing the
+/// same `ExecutablePath` — so with two icons this has to promote *every*
+/// matching entry, and has to keep retrying until it has seen them all
+/// rather than stopping at the first one it finds. Stopping early would
+/// leave the second icon stuck behind the overflow chevron, which for a
+/// widget whose entire job is being glanceable is the one failure that
+/// defeats the point.
+pub fn promote_tray_icon_async(expected_icons: usize) {
+    std::thread::spawn(move || {
         for attempt in 1..=PROMOTE_MAX_ATTEMPTS {
-            match try_promote_tray_icon() {
+            match try_promote_tray_icon(expected_icons) {
                 Ok(PromoteOutcome::Set) => {
                     eprintln!(
-                        "[claude-usage-widget] promoted tray icon to always-show in NotifyIconSettings"
+                        "[claude-usage-widget] promoted {expected_icons} tray icon(s) to always-show in NotifyIconSettings"
                     );
                     return;
                 }
                 Ok(PromoteOutcome::AlreadySet) => {
                     eprintln!(
-                        "[claude-usage-widget] tray icon was already set to always-show"
+                        "[claude-usage-widget] tray icon(s) were already set to always-show"
                     );
                     return;
                 }
@@ -281,10 +316,15 @@ pub fn promote_tray_icon_async() {
     });
 }
 
-/// One lookup attempt: enumerate `NotifyIconSettings` subkeys, find the one
-/// whose `ExecutablePath` matches our own exe, and set `IsPromoted` on it if
-/// it isn't already 1.
-fn try_promote_tray_icon() -> std::io::Result<PromoteOutcome> {
+/// One lookup attempt: enumerate `NotifyIconSettings` subkeys, find *every*
+/// one whose `ExecutablePath` matches our own exe, and set `IsPromoted` on
+/// each that isn't already 1.
+///
+/// Reports `NotFound` until at least `expected_icons` matching entries have
+/// been seen, so the caller's retry loop keeps waiting for icons Windows
+/// hasn't registered a subkey for yet instead of declaring victory on the
+/// first one.
+fn try_promote_tray_icon(expected_icons: usize) -> std::io::Result<PromoteOutcome> {
     let current_exe = std::env::current_exe()?.canonicalize()?;
     let current_exe = current_exe.to_string_lossy().to_lowercase();
 
@@ -293,6 +333,9 @@ fn try_promote_tray_icon() -> std::io::Result<PromoteOutcome> {
         Ok(key) => key,
         Err(_) => return Ok(PromoteOutcome::NotFound),
     };
+
+    let mut matched = 0usize;
+    let mut newly_set = 0usize;
 
     for subkey_name in settings_key.enum_keys().flatten() {
         let subkey = match settings_key
@@ -316,17 +359,30 @@ fn try_promote_tray_icon() -> std::io::Result<PromoteOutcome> {
             continue;
         }
 
+        matched += 1;
+
         let already_promoted = subkey
             .get_value::<u32, _>("IsPromoted")
             .map(|v| v == 1)
             .unwrap_or(false);
         if already_promoted {
-            return Ok(PromoteOutcome::AlreadySet);
+            continue;
         }
 
         subkey.set_value("IsPromoted", &1u32)?;
-        return Ok(PromoteOutcome::Set);
+        newly_set += 1;
     }
 
-    Ok(PromoteOutcome::NotFound)
+    if matched < expected_icons {
+        // Either Windows hasn't written the subkey for every icon yet, or
+        // this exe genuinely has none. Both look the same from here, and the
+        // caller's bounded retry loop handles both correctly.
+        return Ok(PromoteOutcome::NotFound);
+    }
+
+    if newly_set > 0 {
+        Ok(PromoteOutcome::Set)
+    } else {
+        Ok(PromoteOutcome::AlreadySet)
+    }
 }

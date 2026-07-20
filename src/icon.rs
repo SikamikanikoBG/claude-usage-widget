@@ -39,6 +39,24 @@ pub const GRAY: [u8; 3] = [142, 142, 147];
 // as it always has.
 const SIZE: u32 = 96;
 
+/// Radius of the filled badge circle on the `SIZE` canvas.
+const BADGE_RADIUS: f32 = SIZE as f32 / 2.0 - 2.0;
+
+/// The radius digits must stay within. Slightly inside [`BADGE_RADIUS`] so a
+/// digit never runs right up against the circle's anti-aliased edge.
+///
+/// This constraint exists because of a real, screenshot-confirmed rendering
+/// bug: the digit boxes were originally sized to fit the square *canvas*,
+/// which is not the same thing as fitting the *circle* drawn on it. A
+/// two-digit number at the old size put the corners of the top and bottom
+/// segment bars outside the circle, where they were drawn in the digit color
+/// (near-black, for a light badge) onto a fully transparent background. On a
+/// dark taskbar those overhanging pieces are invisible, so the parts of each
+/// digit that survived were the ones inside the circle -- turning "60" into
+/// an unreadable blob. The digits looked *bigger* this way, which is
+/// presumably why it survived earlier design passes, but they read worse.
+const DIGIT_SAFE_RADIUS: f32 = BADGE_RADIUS - 2.0;
+
 /// Picks the icon color from the highest of the two utilization percentages
 /// (green < 50%, amber 50-80%, red > 80%, gray when data is unavailable).
 pub fn color_for(state: &TrayState) -> [u8; 3] {
@@ -62,6 +80,33 @@ pub fn color_for_pct(pct: u32) -> [u8; 3] {
     }
 }
 
+/// CPU temperature (in Celsius) at/above which the temperature icon turns
+/// amber, and at/above which it turns red.
+///
+/// These are deliberately NOT the same thresholds as the usage percentages
+/// above, even though both render as "a number in a colored circle". A CPU at
+/// 50% of anything is meaningless; what matters is absolute degrees. Modern
+/// laptop CPUs sit in the 40-60 C range at idle and routinely touch 80 C
+/// under sustained load without anything being wrong, so amber starts at 70
+/// (working hard) and red at 85 (close enough to thermal throttling to be
+/// worth a glance).
+pub const TEMP_AMBER_C: u32 = 70;
+pub const TEMP_RED_C: u32 = 85;
+
+/// Green/amber/red for a CPU temperature in whole degrees Celsius. Mirrors
+/// [`color_for_pct`] in shape so both tray icons read as the same family of
+/// status indicator, but against temperature thresholds rather than
+/// percentage ones.
+pub fn color_for_temp_c(celsius: u32) -> [u8; 3] {
+    if celsius >= TEMP_RED_C {
+        RED
+    } else if celsius >= TEMP_AMBER_C {
+        AMBER
+    } else {
+        GREEN
+    }
+}
+
 /// Renders a filled circle of the given color into a square RGBA buffer,
 /// with `pct` (when present) drawn as centered digit text on top, and wraps
 /// it as a `tray_icon::Icon`. `pct` is `None` for the "unavailable" state,
@@ -79,7 +124,7 @@ fn build_rgba(color: [u8; 3], pct: Option<u32>) -> Vec<u8> {
     let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
 
     let center = (SIZE as f32 - 1.0) / 2.0;
-    let radius = SIZE as f32 / 2.0 - 2.0;
+    let radius = BADGE_RADIUS;
 
     for y in 0..SIZE {
         for x in 0..SIZE {
@@ -159,14 +204,21 @@ fn digits_of(pct: u32) -> Vec<u8> {
 }
 
 /// (digit width, digit height, gap between digits) in pixels, on the `SIZE`
-/// canvas. Bigger and bolder for fewer digits, same reasoning as before:
-/// the common case (1-2 digits) shouldn't be sized down just to leave room
-/// for the rare 3-digit "100".
+/// canvas. Bigger and bolder for fewer digits: the common case (1-2 digits)
+/// shouldn't be sized down just to leave room for the rare 3-digit "100".
+///
+/// Every one of these is sized so the whole block of digits fits within
+/// [`DIGIT_SAFE_RADIUS`] -- i.e. inside the circle, not merely inside the
+/// square canvas. `digit_blocks_fit_inside_the_badge_circle` enforces that
+/// and will fail if these are ever nudged back up past the boundary. The
+/// numbers are meaningfully smaller than the pre-fix values, and legibility
+/// went *up*, because none of the strokes are being silently cut off any
+/// more.
 fn digit_box_for_count(len: usize) -> (i32, i32, i32) {
     match len {
-        1 => (52, 80, 0),
-        2 => (36, 72, 8),
-        _ => (24, 60, 4),
+        1 => (46, 70, 0),
+        2 => (30, 56, 6),
+        _ => (20, 52, 3),
     }
 }
 
@@ -284,6 +336,16 @@ fn draw_percentage(rgba: &mut [u8], pct: u32, bg: [u8; 3]) {
     let (digit_w, digit_h, gap) = digit_box_for_count(digits.len());
     let total_w = digits.len() as i32 * digit_w + (digits.len() as i32 - 1) * gap;
 
+    // Belt-and-braces companion to the unit test of the same invariant: this
+    // one fires on whatever is actually being rendered, including digit
+    // counts a future change might introduce without remembering to extend
+    // the test's 1..=3 loop.
+    debug_assert!(
+        ((total_w as f32 / 2.0).powi(2) + (digit_h as f32 / 2.0).powi(2)).sqrt()
+            <= DIGIT_SAFE_RADIUS,
+        "digit block {total_w}x{digit_h} would extend outside the badge circle"
+    );
+
     let start_x = (SIZE as i32 - total_w) / 2;
     let start_y = (SIZE as i32 - digit_h) / 2;
     let color = text_color_for(bg);
@@ -299,6 +361,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn temperature_colors_follow_the_documented_thresholds() {
+        assert_eq!(color_for_temp_c(35), GREEN);
+        assert_eq!(color_for_temp_c(TEMP_AMBER_C - 1), GREEN);
+        assert_eq!(color_for_temp_c(TEMP_AMBER_C), AMBER);
+        assert_eq!(color_for_temp_c(TEMP_RED_C - 1), AMBER);
+        assert_eq!(color_for_temp_c(TEMP_RED_C), RED);
+        assert_eq!(color_for_temp_c(99), RED);
+    }
+
+    #[test]
+    fn a_three_digit_temperature_still_renders_without_panicking() {
+        // A CPU reading 100 C+ is exactly when the icon matters most, and it
+        // is the one case that takes the 3-digit layout branch. `digits_of`
+        // clamps at 999, so nothing above can overflow the digit boxes.
+        let rgba = build_rgba(RED, Some(101));
+        assert_eq!(rgba.len(), (SIZE * SIZE * 4) as usize);
+    }
+
+    #[test]
     fn digit_boxes_fit_within_the_canvas() {
         // Regression guard: whatever box size/gap is chosen per digit
         // count, the total width must actually fit on the SIZE x SIZE
@@ -309,6 +390,28 @@ mod tests {
             let total_w = len as i32 * w + (len as i32 - 1) * gap;
             assert!(total_w <= SIZE as i32, "{len}-digit total width {total_w} exceeds canvas {SIZE}");
             assert!(h <= SIZE as i32, "{len}-digit height {h} exceeds canvas {SIZE}");
+        }
+    }
+
+    #[test]
+    fn digit_blocks_fit_inside_the_badge_circle() {
+        // The bug this pins down: `digit_boxes_fit_within_the_canvas` above
+        // passed the whole time the icon was rendering unreadable digits,
+        // because fitting the square canvas is a strictly weaker condition
+        // than fitting the circle drawn on it. The corners of the digit
+        // block are the furthest points from the center, so they are what
+        // has to be inside the radius.
+        for len in 1..=3usize {
+            let (w, h, gap) = digit_box_for_count(len);
+            let total_w = len as i32 * w + (len as i32 - 1) * gap;
+            let half_diagonal = ((total_w as f32 / 2.0).powi(2) + (h as f32 / 2.0).powi(2)).sqrt();
+            assert!(
+                half_diagonal <= DIGIT_SAFE_RADIUS,
+                "{len}-digit block ({total_w}x{h}) has corner distance {half_diagonal:.1}, \
+                 outside the safe radius {DIGIT_SAFE_RADIUS:.1} -- its corners would be \
+                 drawn outside the badge circle onto transparent background and disappear \
+                 against a dark taskbar"
+            );
         }
     }
 

@@ -4,6 +4,46 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.0]
+
+### Added
+
+- **CPU temperature in the tray.** A second tray icon showing the current CPU
+  temperature in degrees Celsius, alongside the usage one — green below 70 °C,
+  amber from 70 °C, red from 85 °C. It updates every 5 seconds, and it's a
+  separate icon on purpose: a menu line needs a click and the panel needs a
+  window, but a tray icon is a number that's just always on screen. (The usage
+  icon can't share it — there's no legible way to fit two numbers into 16
+  physical pixels.)
+  - Toggle it with **Show CPU temperature** in the right-click menu. It's on
+    by default and the choice is remembered across restarts.
+  - No administrator rights needed. The usual way to read CPU temperature on
+    Windows — the `MSAcpi_ThermalZoneTemperature` WMI class — requires
+    elevation, and third-party sensor tools additionally need a kernel driver.
+    This reads the `Thermal Zone Information` performance counters instead,
+    which are available to a normal user, so the widget stays unelevated.
+  - Machines whose firmware exposes no usable thermal zone (this includes most
+    VMs) show a gray icon rather than a wrong number, the same way the usage
+    icon already handles missing data.
+
+### Fixed
+
+- **Two-digit numbers in the tray icon were unreadable.** The digit sizes were
+  chosen to fit the icon's square canvas, but the badge drawn on that canvas
+  is a *circle* — so the corners of the top and bottom segment bars fell
+  outside it, where they were painted in the digit colour onto a transparent
+  background. Against a dark taskbar those overhanging pieces are invisible,
+  leaving only the parts inside the circle and turning a number like `60` into
+  a blob. Digits are now sized to fit the circle. They're slightly smaller and
+  considerably easier to read, since nothing is being silently cut off any
+  more. Confirmed the way this project's icon changes always have to be — on a
+  screenshot of the real tray, not a local preview.
+- **Only the first tray icon was promoted out of the "hidden icons" overflow.**
+  Windows keeps one `NotifyIconSettings` entry per icon, and the promotion
+  logic stopped at the first match for this exe. With a second icon that would
+  have left the temperature hidden behind the chevron — which, for a widget
+  whose entire job is being glanceable, defeats the point.
+
 ## [0.6.0]
 
 ### Added

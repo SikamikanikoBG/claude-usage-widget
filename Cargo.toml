@@ -1,6 +1,6 @@
 [package]
 name = "claude-usage-widget"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 
 [dependencies]
@@ -23,6 +23,11 @@ windows-sys = { version = "0.61.2", features = [
     # SetStdHandle, used by `log.rs` to point this console-less process's
     # stderr at a real log file.
     "Win32_System_Console",
+    # PDH (Performance Data Helper), used by `cpu_temp.rs` to read the
+    # thermal-zone counters. Deliberately chosen over WMI, which would mean
+    # either admin rights (MSAcpi_ThermalZoneTemperature) or dragging COM and
+    # the full `windows` crate into a binary that currently needs neither.
+    "Win32_System_Performance",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",

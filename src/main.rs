@@ -13,6 +13,7 @@
 // and the app's own HKCU settings key for the floating usage panel.
 #![windows_subsystem = "windows"]
 
+mod cpu_temp;
 mod icon;
 mod log;
 mod notify;
@@ -83,9 +84,23 @@ const NOTIFY_THRESHOLD: u32 = 90;
 /// before the separator.
 const EXTRA_USAGE_MENU_POSITION: usize = 3;
 
+/// How often the CPU temperature is sampled.
+///
+/// Deliberately much faster than the usage poll interval, and deliberately
+/// not user-configurable. The reason the usage poll has a 1-minute floor and
+/// a configurable interval is that it hits an undocumented, rate-limited
+/// remote endpoint; none of that applies here. This reads a local Windows
+/// performance counter, so it costs nothing and touches no network. A
+/// temperature that updates once every 5 minutes would be useless for the
+/// stated purpose -- noticing the machine getting hot at a glance.
+const CPU_TEMP_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 enum UserEvent {
     Menu(MenuEvent),
     Usage(TrayState),
+    /// Latest CPU temperature in whole degrees Celsius, or `None` when this
+    /// machine exposes no usable thermal sensor / the sample failed.
+    CpuTemp(Option<u32>),
 }
 
 fn main() {
@@ -160,6 +175,8 @@ fn main() {
     let worker_proxy = event_loop.create_proxy();
     let refresh_tx = spawn_worker(worker_proxy, Arc::clone(&poll_interval_secs));
 
+    spawn_cpu_temp_worker(event_loop.create_proxy());
+
     // Menu items that need their text/state updated as usage data comes in.
     let session_item = MenuItem::new("Session  loading...", false, None);
     let weekly_item = MenuItem::new("Weekly   loading...", false, None);
@@ -181,6 +198,17 @@ fn main() {
         registry::is_startup_enabled(),
         None,
     );
+
+    // Second tray icon showing CPU temperature (see `cpu_temp.rs`). It's a
+    // separate icon rather than another line in this menu or another bar in
+    // the panel because the whole point is glanceability: a menu line needs a
+    // click, the panel needs a window, but a tray icon is a number that's
+    // just always on screen next to the usage one. It can't share the usage
+    // icon -- that one is already showing two digits of its own, and there is
+    // no legible way to fit two numbers into 16 physical pixels.
+    let cpu_temp_visible_initial = registry::is_cpu_temp_visible();
+    let cpu_temp_item =
+        CheckMenuItem::new("Show CPU temperature", true, cpu_temp_visible_initial, None);
 
     // Floating usage panel (see `panel.rs`): off by default on first run,
     // restored to whatever the user last chose otherwise.
@@ -291,6 +319,7 @@ fn main() {
         &PredefinedMenuItem::separator(),
         &refresh_item,
         &startup_item,
+        &cpu_temp_item,
         &panel_submenu,
         &poll_interval_submenu,
         &PredefinedMenuItem::separator(),
@@ -298,6 +327,15 @@ fn main() {
     ]);
 
     let mut tray_icon: Option<tray_icon::TrayIcon> = None;
+    // Present only while the CPU-temperature icon is enabled: dropping the
+    // `TrayIcon` is what removes it from the tray, and rebuilding it is what
+    // puts it back, so the `Option` is the on/off state rather than a
+    // separate flag that could drift out of sync with reality.
+    let mut temp_tray: Option<tray_icon::TrayIcon> = None;
+    // Last temperature seen, kept so that toggling the icon back on can
+    // render the current reading immediately instead of showing an
+    // unavailable-gray icon until the next sample comes in.
+    let mut last_temp_c: Option<u32> = None;
     let mut panel_hwnd: HWND = std::ptr::null_mut();
 
     // Edge-triggered threshold-notification state: true once we've already
@@ -322,12 +360,18 @@ fn main() {
                         .expect("failed to create tray icon"),
                 );
 
-                // Best-effort: pin our icon to "always show" instead of
-                // leaving it behind the overflow chevron. Runs on its own
+                if cpu_temp_visible_initial {
+                    temp_tray = build_temp_tray(&tray_menu, last_temp_c);
+                }
+
+                // Best-effort: pin our icon(s) to "always show" instead of
+                // leaving them behind the overflow chevron. Runs on its own
                 // thread with retries since Windows registers the
                 // NotifyIconSettings entry asynchronously; never blocks
-                // startup and never panics on failure.
-                registry::promote_tray_icon_async();
+                // startup and never panics on failure. The count matters --
+                // Windows keeps one entry per icon, and promoting only the
+                // first would leave the temperature icon hidden.
+                registry::promote_tray_icon_async(if cpu_temp_visible_initial { 2 } else { 1 });
 
                 // Create the (initially hidden, unless persisted otherwise)
                 // floating usage panel window. Created once here and only
@@ -395,6 +439,13 @@ fn main() {
                 }
             }
 
+            Event::UserEvent(UserEvent::CpuTemp(celsius)) => {
+                last_temp_c = celsius;
+                if let Some(tray) = temp_tray.as_ref() {
+                    apply_temp_to_tray(tray, celsius);
+                }
+            }
+
             Event::UserEvent(UserEvent::Menu(event)) => {
                 if event.id == refresh_item.id() {
                     let _ = refresh_tx.send(());
@@ -408,6 +459,26 @@ fn main() {
                         );
                         // Reflect the real state back if the write failed.
                         startup_item.set_checked(!desired);
+                    }
+                } else if event.id == cpu_temp_item.id() {
+                    // muda has already flipped the visual checkmark; make the
+                    // tray and the registry agree with it.
+                    let desired = cpu_temp_item.is_checked();
+                    if let Err(e) = registry::set_cpu_temp_visible(desired) {
+                        eprintln!(
+                            "[claude-usage-widget] failed to persist CPU temperature visibility: {e}"
+                        );
+                    }
+                    if desired {
+                        temp_tray = build_temp_tray(&tray_menu, last_temp_c);
+                        // Only worth re-running when an icon was just added;
+                        // the entry for a newly registered icon won't exist
+                        // until Windows gets around to writing it.
+                        registry::promote_tray_icon_async(2);
+                    } else {
+                        // Dropping the TrayIcon is what removes it from the
+                        // tray -- there's no explicit hide call.
+                        temp_tray.take();
                     }
                 } else if event.id == panel_visible_item.id() {
                     let desired = panel_visible_item.is_checked();
@@ -436,6 +507,7 @@ fn main() {
                     select_poll_interval(&poll_interval_items, &poll_interval_secs, *secs);
                 } else if event.id == quit_item.id() {
                     tray_icon.take();
+                    temp_tray.take();
                     *control_flow = ControlFlow::Exit;
                 } else {
                     eprintln!("[claude-usage-widget] menu: unmatched event id {:?}", event.id);
@@ -443,6 +515,107 @@ fn main() {
             }
 
             _ => {}
+        }
+    });
+}
+
+/// Builds the CPU-temperature tray icon, sharing the main tray menu so a
+/// right-click on either icon opens the same menu (including the toggle that
+/// turns this one back off -- without the shared menu, hiding it would be a
+/// one-way trip unless the user knew to right-click the *other* icon).
+///
+/// Returns `None` if the icon couldn't be created, which is logged and then
+/// treated as "the feature is simply not showing" rather than being fatal:
+/// the usage icon, the panel and the menu all keep working regardless.
+fn build_temp_tray(menu: &Menu, celsius: Option<u32>) -> Option<tray_icon::TrayIcon> {
+    let built = TrayIconBuilder::new()
+        .with_icon(temp_icon(celsius))
+        .with_tooltip(temp_tooltip(celsius))
+        .with_menu(Box::new(menu.clone()))
+        .build();
+
+    match built {
+        Ok(tray) => Some(tray),
+        Err(e) => {
+            eprintln!("[claude-usage-widget] failed to create the CPU temperature tray icon: {e}");
+            None
+        }
+    }
+}
+
+/// Pushes a new reading onto an existing temperature tray icon.
+fn apply_temp_to_tray(tray: &tray_icon::TrayIcon, celsius: Option<u32>) {
+    let _ = tray.set_icon(Some(temp_icon(celsius)));
+    let _ = tray.set_tooltip(Some(temp_tooltip(celsius)));
+}
+
+/// The temperature icon itself: the number in degrees Celsius over a
+/// threshold color, or -- when there's no reading -- the same plain gray,
+/// digitless circle the usage icon uses for "unavailable", so the two icons
+/// fail in a visually consistent way instead of this one inventing its own
+/// idea of what missing data looks like.
+fn temp_icon(celsius: Option<u32>) -> tray_icon::Icon {
+    match celsius {
+        Some(c) => icon::render(icon::color_for_temp_c(c), Some(c)),
+        None => icon::render(icon::GRAY, None),
+    }
+}
+
+/// Tooltip for the temperature icon. Kept deliberately short: Windows
+/// silently truncates tray tooltips at 63 characters (see the note in
+/// `usage.rs` on the same constraint), and there is nothing to say here
+/// beyond the number anyway.
+fn temp_tooltip(celsius: Option<u32>) -> String {
+    match celsius {
+        Some(c) => format!("CPU temperature: {c}\u{00B0}C"),
+        None => "CPU temperature: unavailable".to_string(),
+    }
+}
+
+/// Spawns the background thread that samples the CPU temperature and pushes
+/// it to the event loop every [`CPU_TEMP_POLL_INTERVAL`].
+///
+/// Runs unconditionally, even when the temperature icon is hidden. Sampling a
+/// local performance counter is essentially free, and keeping the thread
+/// running means toggling the icon on shows a live number immediately rather
+/// than a gray circle for the first few seconds. If the machine has no usable
+/// thermal sensor, this reports that once and then stops -- there's no point
+/// re-checking a hardware capability every 5 seconds forever.
+fn spawn_cpu_temp_worker(proxy: EventLoopProxy<UserEvent>) {
+    thread::spawn(move || {
+        let reader = match cpu_temp::CpuTempReader::new() {
+            Some(reader) => reader,
+            None => {
+                let _ = proxy.send_event(UserEvent::CpuTemp(None));
+                return;
+            }
+        };
+
+        // Only logged when the value actually changes: at a 5-second
+        // interval an unconditional heartbeat would be 17,000 lines a day and
+        // would bury the poll/backoff lines this log exists for. The usage
+        // worker logs every attempt for a specific reason (telling "wedged"
+        // apart from "quietly fine" during a real incident) that doesn't
+        // apply to a local counter which can't hang on a network call.
+        let mut last_logged: Option<u32> = None;
+
+        loop {
+            let celsius = reader.read_celsius().map(|c| c.round().max(0.0) as u32);
+
+            if celsius != last_logged {
+                match celsius {
+                    Some(c) => eprintln!("[claude-usage-widget] cpu temp: {c}C"),
+                    None => eprintln!("[claude-usage-widget] cpu temp: sample unavailable"),
+                }
+                last_logged = celsius;
+            }
+
+            if proxy.send_event(UserEvent::CpuTemp(celsius)).is_err() {
+                // The event loop is gone (app is shutting down).
+                break;
+            }
+
+            thread::sleep(CPU_TEMP_POLL_INTERVAL);
         }
     });
 }

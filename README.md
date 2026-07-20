@@ -63,6 +63,41 @@ segments - deliberately not a small pixel font with an outline, which turned
 out to be illegible at real tray-icon size (see [CHANGELOG.md](CHANGELOG.md)
 for why).
 
+### CPU temperature icon
+
+![The two tray icons side by side: CPU temperature at 62 °C, usage at 42%](docs/cpu-temp-icon.png)
+
+A second tray icon sits next to the usage one showing the current CPU
+temperature in degrees Celsius, in the same circular badge style:
+
+- **Green**: under 70 °C
+- **Amber**: 70-84 °C
+- **Red**: 85 °C and above
+- **Gray, no digits**: this machine exposes no usable thermal sensor, or the
+  last sample failed
+
+It refreshes every 5 seconds. Unlike the usage poll there's nothing to
+configure and no reason to slow it down - it reads a local Windows
+performance counter, so it costs nothing and talks to no one.
+
+Turn it off (or back on) with **Show CPU temperature** in the right-click
+menu; it's on by default and the choice is remembered. Right-clicking either
+icon opens the same menu.
+
+**This needs no administrator rights.** The usual way to read CPU temperature
+on Windows is the `MSAcpi_ThermalZoneTemperature` WMI class, which requires
+elevation, and third-party sensor tools generally need a kernel driver on top
+of that. This widget reads the `Thermal Zone Information` performance
+counters, which a normal user can read, so it stays unelevated like the rest
+of the app.
+
+The trade-off is that it reports what the firmware's ACPI thermal zones
+report. On a machine that exposes a CPU-specific zone that's exactly what you
+get; where firmware only exposes generic zones, the widget shows the hottest
+plausible one. Machines with no thermal zones at all - most virtual machines,
+some desktops - show the gray icon. It is not a substitute for a dedicated
+sensor tool if you want per-core detail.
+
 ### Tooltip
 
 Hovering the icon shows a three-line summary - the live session and weekly
@@ -93,6 +128,7 @@ Projected [███████░░░] 71% (under)
 ---------------------------------------------
 Refresh now
 ✓ Start with Windows
+✓ Show CPU temperature
 Usage panel        >
 Poll interval       >
 ---------------------------------------------
@@ -244,6 +280,11 @@ telemetry, no third-party service.
 It reads exactly one local file: your existing Claude Code credentials cache
 at `%USERPROFILE%\.claude\.credentials.json`.
 
+For the CPU temperature it reads the local `Thermal Zone Information`
+performance counters through Windows' own PDH API. That's a read-only query
+against data Windows already publishes to any user; it needs no elevation,
+installs no driver, and sends nothing anywhere.
+
 It writes to exactly three registry locations, and nothing else:
 
 - `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` - the
@@ -252,8 +293,9 @@ It writes to exactly three registry locations, and nothing else:
   again if you turn it off.
 - `HKEY_CURRENT_USER\Software\ClaudeUsageWidget` - this widget's own
   settings key, holding the floating panel's visibility, mode, opacity and
-  dragged-to position, plus the configured poll interval. Updated whenever
-  you change those from the tray menu or move the panel.
+  dragged-to position, the configured poll interval, and whether the CPU
+  temperature icon is shown. Updated whenever you change those from the tray
+  menu or move the panel.
 - `HKEY_CURRENT_USER\Control Panel\NotifyIconSettings` - a key Windows
   itself owns and maintains for every app that has ever registered a tray
   icon. The widget only sets the `IsPromoted` value (a DWORD) on its own
@@ -304,6 +346,14 @@ check "Start with Windows".
 - The tray icon is rendered in memory (anti-aliased filled circle with bold
   seven-segment digits blitted on top) rather than shipped as a static asset
   file, so the color and number always match the live data.
+- CPU temperature comes from a separate 5-second thread holding one open PDH
+  query against `\Thermal Zone Information(*)\High Precision Temperature`
+  (falling back to the whole-Kelvin `\...\Temperature` counter). Counter names
+  are localized on non-English Windows, so it binds via
+  `PdhAddEnglishCounterW` rather than the localized path. Readings arrive in
+  Kelvin; zones that aren't wired to a sensor report absolute zero and are
+  filtered out, a CPU-named zone is preferred when the firmware exposes one,
+  and otherwise the hottest plausible zone wins.
 - The floating usage panel is a plain always-on-top Win32 popup window,
   positioned from the primary monitor's work area, drawn with raw GDI calls -
   no extra windowing/UI crate.
@@ -324,6 +374,10 @@ check "Start with Windows".
 - No historical charts or trend graphs - it's intentionally just the
   at-a-glance tray view, the optional floating panel, and the one
   90%-threshold notification.
+- The CPU temperature is only as good as what the firmware's ACPI thermal
+  zones report, and some machines (most VMs, some desktops) expose none at
+  all. There's no per-core breakdown and no temperature alerting - if you need
+  either, you want a dedicated sensor tool, not this.
 
 ## License
 
