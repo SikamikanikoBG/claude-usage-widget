@@ -110,6 +110,108 @@ plausible one. Machines with no thermal zones at all - most virtual machines,
 some desktops - show the gray icon. It is not a substitute for a dedicated
 sensor tool if you want per-core detail.
 
+### Inference server icons (vLLM / Ollama)
+
+If you run your own models, the widget can watch those servers too and put
+whichever numbers you care about straight in the tray, next to the usage and
+temperature badges - live tokens/sec, live connections, queue depth, KV-cache
+occupancy, time-to-first-token.
+
+**Server metrics are hexagons**, continuing the same shape-not-colour rule:
+usage is round, CPU temperature is square, server metrics are hexagonal. Each
+icon can override its own shape if you'd rather group them differently.
+
+Everything lives in `%LOCALAPPDATA%\ClaudeUsageWidget\servers.json`, created
+on first run with both example servers **disabled** - so nothing changes, and
+nothing is contacted, until you edit it:
+
+```json
+{
+  "servers": [
+    { "name": "vader-vllm",   "kind": "vllm",   "url": "http://vader:8010",  "poll_secs": 10, "enabled": true },
+    { "name": "vader-ollama", "kind": "ollama", "url": "http://vader:11434", "poll_secs": 30, "enabled": true }
+  ],
+  "tray_icons": [
+    { "server": "vader-vllm", "metric": "tps",     "visible": true },
+    { "server": "vader-vllm", "metric": "running", "visible": true },
+    { "server": "vader-vllm", "metric": "kv",      "visible": false }
+  ]
+}
+```
+
+The **Servers** submenu in the right-click menu shows a live status line per
+server, a checkbox per icon, and **Edit servers.json...** / **Reload
+servers.json** so a config change doesn't need a restart.
+
+Per-server options: `poll_secs` (floor 2s), `timeout_ms`, `enabled`, and
+`auth_env` - the *name* of an environment variable holding a bearer token, so
+the token itself never lands in a file you might copy between machines. Per-icon
+options: `shape` (`hex` / `circle` / `square`), `visible`, `warn` and `crit`
+thresholds, and `label` to shorten the tooltip.
+
+#### The metric catalog
+
+| id | server | what it is |
+|---|---|---|
+| `tps` | both | **Decode speed** - generated tokens ÷ the server's *own* decode time. How fast it generates while it is generating; unaffected by idle time. |
+| `tps_wall` | vLLM | Throughput over wall-clock time, idle included. What the box actually produced. |
+| `prefill_tps` | both | Prompt-processing speed, counting only tokens actually computed (i.e. excluding prefix-cache hits). |
+| `running` | vLLM | Requests in the execution batch right now - live connections doing work. |
+| `waiting` | vLLM | Requests admitted but queued. Above zero means the server is the bottleneck. Amber at 1, red at 5. |
+| `reqmin` | vLLM | Requests finished per minute over the last interval. |
+| `ttft` | both | Average time to first token. |
+| `tpot` | vLLM | Average time per output token. |
+| `kv` | vLLM | KV-cache occupancy. Amber at 80%, red at 95%. |
+| `prefix` | vLLM | Prefix-cache hit rate - how much of each prompt didn't have to be recomputed. |
+| `errors` | vLLM | Requests that finished as error or abort during the last interval. |
+| `preempt` | vLLM | Requests evicted mid-flight because KV cache ran out. |
+| `models` | Ollama | Models currently resident. |
+| `vram` | Ollama | VRAM held by loaded models. |
+| `installed` | Ollama | Models available locally. |
+| `up` | both | Reachability only - no digits, just green or red. |
+
+Badges hold three digits, so values are clamped at 999 and latencies are drawn
+as tenths of a second (`16` = 1.6 s), spelled out in full in the tooltip.
+
+#### Two different "tokens per second"
+
+Prometheus counters are cumulative, so every rate here is a difference between
+two scrapes - and the denominator you pick changes what the number *means*:
+
+- **`tps`** divides by the server's own accumulated decode time. This is the
+  number benchmarks quote, and it doesn't sag just because the server was idle
+  for half the interval.
+- **`tps_wall`** divides by wall-clock time. This is what the box actually
+  produced, and it sits near zero whenever nothing is running.
+
+If the server restarts, its counters reset to zero; the widget notices any
+counter moving backwards and re-baselines rather than reporting a spike.
+Averages that are properties of *requests* rather than of time - TTFT, TPOT,
+cache hit rate - hold their last value through an idle interval instead of
+collapsing to zero.
+
+#### Ollama gives less, and the widget says so
+
+Ollama publishes no aggregate metrics at all. As of 0.32.14 both `/metrics`
+and `/debug/vars` return 404, and per-request timings (`eval_count`,
+`eval_duration`) exist only inside individual response bodies, which a passive
+observer never sees. So from Ollama you get resident models, VRAM, installed
+count and reachability - and live throughput only if you opt into a
+**synthetic probe**:
+
+```json
+{ "name": "vader-ollama", "kind": "ollama", "url": "http://vader:11434",
+  "probe": { "enabled": true, "interval_secs": 300, "num_predict": 32 } }
+```
+
+That asks the server to generate a few tokens and reads the timings back out
+of the response. It is genuinely load the widget itself creates, so it is off
+by default, floored at one probe per minute, and **refuses to touch a model
+that isn't already loaded** - without that rule, a tray widget sitting open on
+a laptop could pull tens of gigabytes into a remote box's VRAM (evicting
+whatever was there) purely as a side effect of being open. Note that probing
+does reset that model's keep-alive timer.
+
 ### Tooltip
 
 Hovering the icon shows a three-line summary - the live session and weekly
@@ -142,6 +244,7 @@ Refresh now
 ✓ Start with Windows
 ✓ Show CPU temperature
 Usage panel        >
+Servers            >
 Poll interval       >
 ---------------------------------------------
 Quit
@@ -164,7 +267,7 @@ It's left out entirely when extra usage isn't enabled on your account, which
 is the common case.
 
 - **Refresh now** - forces an immediate re-check without waiting for the
-  timer, unless the widget is currently backing off after a failed request
+  timer (and re-scrapes every configured server, ignoring their backoff), unless the widget is currently backing off after a failed request
   (see [Reliability](#reliability-refresh-backoff-and-why-gray) below), in
   which case it's deliberately ignored until the backoff clears.
 - **Start with Windows** - toggles launching the widget at sign-in.
@@ -172,6 +275,12 @@ is the common case.
   exclusive display-mode options (**Both**, **5-hour only**, **Weekly only**,
   **Rotating**), an **Opacity** submenu and **Reset position**. See
   [Floating usage panel](#floating-usage-panel) below.
+- **Servers** submenu - a live status line for each configured inference
+  server (`vader-vllm  qwen3.8-27b · 47 tok/s · 1 running · 0 queued · KV 3%`),
+  a **Show ...** checkbox per configured tray icon, and **Edit servers.json...**
+  / **Reload servers.json**. Reloading re-reads the file and rebuilds the icons
+  in place, no restart. See
+  [Inference server icons](#inference-server-icons-vllm--ollama).
 - **Poll interval** submenu - **1 minute**, **2 minutes**, **5 minutes**
   (default), **10 minutes**. Changing it applies immediately, no restart
   needed. 1 minute is a hard floor enforced in code, not just in the list of
@@ -285,9 +394,12 @@ Both schedules reset back to the normal poll interval on the next success.
 
 ## Privacy / what it talks to and touches
 
-This widget makes network requests to **`api.anthropic.com` only**, using
-**your own already-cached token** - nothing else, no analytics, no
-telemetry, no third-party service.
+This widget makes network requests to **`api.anthropic.com`**, using **your own
+already-cached token**, and to **whatever inference servers you list yourself
+in `servers.json`** (see [Inference server icons](#inference-server-icons-vllm--ollama)) -
+nothing else, no analytics, no telemetry, no third-party service. Out of the
+box that list is empty and disabled, so a fresh install talks only to
+Anthropic.
 
 It reads exactly one local file: your existing Claude Code credentials cache
 at `%USERPROFILE%\.claude\.credentials.json`.

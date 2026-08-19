@@ -4,6 +4,61 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.0]
+
+### Added
+
+- **Inference-server monitoring, with a tray icon per metric.** The widget can
+  now watch any number of vLLM and Ollama servers and put whichever numbers you
+  care about straight in the tray — live tokens/sec, live connections, queue
+  depth, KV-cache occupancy, TTFT, requests/min. Configure it in
+  `%LOCALAPPDATA%\ClaudeUsageWidget\servers.json`; the file is created on first
+  run with both example servers disabled, so nothing changes until you edit it.
+  There's a **Servers** submenu with a live status line per server, a checkbox
+  per icon, and **Edit** / **Reload** so a config change doesn't need a restart.
+  - **The server icons are hexagons**, continuing the shape-not-colour rule the
+    square temperature badge established: usage is round, CPU temperature is
+    square, server metrics are hexagonal. Per-icon `"shape"` overrides it.
+    The hexagon draws *smaller* digits than the circle, which looks backwards
+    on paper and was settled by a screenshot of the real tray: the circle's
+    boxes do fit inside it (by about a pixel at two digits), but they ran
+    right up against the slanted edges and read as a solid block. Same lesson
+    as the 3-digit fix in 0.7.0 — fitting and being legible are different
+    tests, and only one of them can be run locally.
+  - **Two different tokens/sec are offered, because they answer different
+    questions.** `tps` divides generated tokens by the server's *own* decode
+    time — how fast it generates while it is generating, the number benchmarks
+    quote, unaffected by idle time. `tps_wall` divides by wall-clock — what the
+    box actually produced, near zero whenever nothing is running.
+  - Rates come from counter deltas between scrapes, so a **server restart is
+    detected** (any counter moving backwards) and re-baselines instead of
+    reporting a spike. Averages that are properties of requests rather than of
+    time — TTFT, TPOT, cache hit rate — hold their last value through an idle
+    interval instead of collapsing to zero, and fall back to the server's
+    lifetime figures on the very first scrape so the icons show something real
+    immediately.
+- **Ollama support, with an honest ceiling.** Ollama publishes no aggregate
+  metrics at all — verified against 0.32.14: `/metrics` and `/debug/vars` are
+  both 404, and per-request timings exist only inside individual response
+  bodies. So it gets resident models, VRAM held, installed-model count and
+  reachability for free, and live throughput only via an **opt-in synthetic
+  probe** that generates a few tokens and reads the timings back. The probe is
+  off by default, floored at one per minute, and **refuses to touch a model
+  that isn't already loaded** — otherwise a tray widget could pull tens of
+  gigabytes into a remote box's VRAM purely as a side effect of being open.
+- Servers can sit behind auth: `"auth_env"` names an environment variable
+  holding a bearer token, so the token itself never lands in the config file.
+
+### Changed
+
+- **"Refresh now" also re-scrapes every server**, ignoring backoff.
+- Failed scrapes use the fast connectivity backoff (5s doubling to 60s), not
+  the cautious rate-limit schedule the Anthropic endpoint needs — a laptop off
+  the LAN for ten seconds should show a gray icon for ten seconds.
+- Tray-icon promotion (out of the overflow chevron) now counts *every*
+  registered icon rather than one or two, since Windows keeps one
+  `NotifyIconSettings` subkey per icon.
+
 ## [0.7.0]
 
 ### Added

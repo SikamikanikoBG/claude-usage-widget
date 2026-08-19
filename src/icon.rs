@@ -54,6 +54,26 @@ pub enum BadgeShape {
     Circle,
     /// CPU temperature.
     RoundedSquare,
+    /// Inference-server metrics (`servers.json`). A third silhouette rather
+    /// than a third colour scheme, for the same reason the square exists:
+    /// once several icons can be green at the same time, colour stops
+    /// identifying anything. Pointed left and right with flat top and bottom
+    /// edges, so it differs from the circle exactly where the square doesn't
+    /// (the sides) and from the square exactly where the circle doesn't (the
+    /// top). Which shape a given server metric uses is configurable, because
+    /// how these read at 16 physical pixels is a matter for a real
+    /// screenshot, not for a test.
+    Hexagon,
+}
+
+#[cfg(test)]
+impl BadgeShape {
+    /// Every shape, for the geometry tests that must hold for all of them.
+    pub const ALL: [BadgeShape; 3] = [
+        BadgeShape::Circle,
+        BadgeShape::RoundedSquare,
+        BadgeShape::Hexagon,
+    ];
 }
 
 /// Radius of the filled badge circle on the `SIZE` canvas.
@@ -70,6 +90,19 @@ const SQUARE_HALF: f32 = SIZE as f32 / 2.0 - 2.0;
 /// reading as a circle again at tray size -- which would defeat the whole
 /// point of using shape as the distinguishing signal.
 const SQUARE_CORNER_RADIUS: f32 = 21.0;
+
+/// The hexagon's half-extents, matching the circle's radius and the square's
+/// half-width so all three badges occupy the same tray footprint.
+const HEX_HALF_W: f32 = SIZE as f32 / 2.0 - 2.0;
+const HEX_HALF_H: f32 = SIZE as f32 / 2.0 - 2.0;
+
+/// How much of the half-width is cut away by the time the edge reaches the
+/// top (and bottom) of the badge -- i.e. how slanted the four diagonal edges
+/// are. Chosen as the largest cut that still leaves the circle's own digit
+/// boxes fitting inside the slanted edges (see `digit_block_fits`), so the
+/// hexagon buys its distinct silhouette without shrinking the digits, which
+/// are the part that actually has to be read.
+const HEX_CUT: f32 = 0.42;
 
 /// The radius digits must stay within on a *circular* badge. Slightly inside
 /// [`BADGE_RADIUS`] so a digit never runs right up against the circle's
@@ -177,6 +210,9 @@ fn build_rgba(color: [u8; 3], pct: Option<u32>, shape: BadgeShape) -> Vec<u8> {
                     SQUARE_HALF,
                     SQUARE_CORNER_RADIUS,
                 ),
+                BadgeShape::Hexagon => {
+                    (0.5 - hex_signed_distance(px - center, py - center)).clamp(0.0, 1.0)
+                }
             };
             if coverage <= 0.0 {
                 continue;
@@ -252,7 +288,7 @@ fn digits_of(pct: u32) -> Vec<u8> {
 ///
 /// Every one of these is sized so the whole block of digits fits within
 /// [`DIGIT_SAFE_RADIUS`] -- i.e. inside the circle, not merely inside the
-/// square canvas. `digit_blocks_fit_inside_the_badge_circle` enforces that
+/// square canvas. `digit_blocks_fit_inside_the_badge` enforces that
 /// and will fail if these are ever nudged back up past the boundary. The
 /// numbers are meaningfully smaller than the pre-fix values, and legibility
 /// went *up*, because none of the strokes are being silently cut off any
@@ -281,7 +317,43 @@ fn digit_box_for_count(shape: BadgeShape, len: usize) -> (i32, i32, i32) {
             2 => (34, 58, 6),
             _ => (24, 54, 3),
         },
+        // Smaller than the circle's at every digit count, which looks
+        // backwards on paper and is right in practice. The circle's boxes do
+        // *fit* inside this hexagon -- by about one pixel at two digits --
+        // and a screenshot of the real tray is what settled it: at that size
+        // the digits ran right up to the slanted edges and read as a solid
+        // block, next to a square badge whose visible margin reads cleanly.
+        // Margin is worth more than height here. (Same lesson as the
+        // 3-digit fix in 0.7.0: fitting and being legible are different
+        // tests, and only one of them can be run locally.)
+        BadgeShape::Hexagon => match len {
+            1 => (40, 62, 0),
+            2 => (28, 50, 5),
+            _ => (19, 46, 3),
+        },
     }
+}
+
+/// Signed distance from the hexagon's edge: negative inside, positive
+/// outside, in pixels. The hexagon is the intersection of three slabs -- the
+/// flat top/bottom pair and the two slanted pairs -- so the distance is the
+/// largest of the three, which is exact everywhere except within a pixel of
+/// the vertices (irrelevant for a one-pixel anti-aliased edge).
+fn hex_signed_distance(dx: f32, dy: f32) -> f32 {
+    let x = dx.abs();
+    let y = dy.abs();
+
+    // Flat top and bottom edges.
+    let flat = y - HEX_HALF_H;
+
+    // The slanted edge running from (HEX_HALF_W, 0) to
+    // (HEX_HALF_W * (1 - HEX_CUT), HEX_HALF_H), normalized to a true
+    // perpendicular distance.
+    let cut = HEX_HALF_W * HEX_CUT;
+    let norm = (HEX_HALF_H * HEX_HALF_H + cut * cut).sqrt();
+    let slant = (HEX_HALF_H * x + cut * y - HEX_HALF_H * HEX_HALF_W) / norm;
+
+    flat.max(slant)
 }
 
 /// Whether a digit block of `total_w` x `h`, centered, fits inside `shape`.
@@ -310,6 +382,13 @@ fn digit_block_fits(shape: BadgeShape, total_w: i32, h: i32) -> bool {
             let over_y = (half_h - straight).max(0.0);
             over_x.hypot(over_y) <= SQUARE_CORNER_RADIUS
         }
+        // Same idea as the circle: the block's corners are its furthest
+        // points, so they are what has to clear the slanted edges. The
+        // margin is 3px rather than the circle's 1, because a screenshot
+        // showed that "geometrically inside" and "reads as a number on a
+        // badge" are two different bars on this shape -- the slanted edges
+        // close in on the block from four directions at once.
+        BadgeShape::Hexagon => hex_signed_distance(half_w, half_h) <= -3.0,
     }
 }
 
@@ -477,7 +556,7 @@ mod tests {
         // count, the total width must actually fit on the SIZE x SIZE
         // canvas (with room to spare for centering), or digits would get
         // clipped at the edges instead of just looking small.
-        for shape in [BadgeShape::Circle, BadgeShape::RoundedSquare] {
+        for shape in BadgeShape::ALL {
             for len in 1..=3usize {
                 let (w, h, gap) = digit_box_for_count(shape, len);
                 let total_w = len as i32 * w + (len as i32 - 1) * gap;
@@ -491,14 +570,14 @@ mod tests {
     }
 
     #[test]
-    fn digit_blocks_fit_inside_the_badge_circle() {
+    fn digit_blocks_fit_inside_the_badge() {
         // The bug this pins down: `digit_boxes_fit_within_the_canvas` above
         // passed the whole time the icon was rendering unreadable digits,
         // because fitting the square canvas is a strictly weaker condition
         // than fitting the circle drawn on it. The corners of the digit
         // block are the furthest points from the center, so they are what
         // has to be inside the radius.
-        for shape in [BadgeShape::Circle, BadgeShape::RoundedSquare] {
+        for shape in BadgeShape::ALL {
             for len in 1..=3usize {
                 let (w, h, gap) = digit_box_for_count(shape, len);
                 let total_w = len as i32 * w + (len as i32 - 1) * gap;
@@ -553,6 +632,61 @@ mod tests {
     }
 
     #[test]
+    fn the_hexagon_is_distinguishable_from_both_of_the_others() {
+        // Same argument as the test above, extended to the third silhouette,
+        // which now has to differ from TWO existing shapes rather than one.
+        // Two probe points do it: the hexagon reaches further out at the
+        // vertical midline than the circle does, and (like the circle, unlike
+        // the square) leaves the diagonal corners empty.
+        let circle = build_rgba(GREEN, Some(42), BadgeShape::Circle);
+        let square = build_rgba(GREEN, Some(42), BadgeShape::RoundedSquare);
+        let hex = build_rgba(GREEN, Some(42), BadgeShape::Hexagon);
+
+        let alpha_at = |buf: &[u8], x: u32, y: u32| buf[(((y * SIZE) + x) * 4 + 3) as usize];
+
+        // Corner: filled on the square, empty on both the circle and the hex.
+        assert_eq!(alpha_at(&hex, 14, 14), 0, "hexagon should not fill its corners");
+        assert!(alpha_at(&square, 14, 14) > 200);
+
+        // Near the top edge but well off-center: the hexagon's flat top is
+        // still solid out here, while the circle has already curved away.
+        // (Deliberately not probed at the vertical midline -- the hexagon's
+        // side points and the circle's radius coincide there, so that would
+        // have compared the one place the two shapes agree.)
+        let (x, y) = (72u32, 6u32);
+        assert!(
+            alpha_at(&hex, x, y) > 200,
+            "hexagon's flat top should still be solid here (got alpha {})",
+            alpha_at(&hex, x, y)
+        );
+        assert_eq!(
+            alpha_at(&circle, x, y),
+            0,
+            "circle should have curved away by here"
+        );
+    }
+
+    #[test]
+    fn the_hexagon_has_flat_top_and_bottom_edges() {
+        // What makes it read as a hexagon rather than a slightly-wrong circle
+        // at 16 pixels: a genuinely straight run across the top. If a future
+        // tweak to HEX_CUT rounded that away, the third icon would stop being
+        // tellable from the first at a glance.
+        let hex = build_rgba(GREEN, None, BadgeShape::Hexagon);
+        let alpha_at = |x: u32, y: u32| hex[(((y * SIZE) + x) * 4 + 3) as usize];
+
+        // The top edge sits at y = center - HEX_HALF_H = 2, so y = 3 is one
+        // pixel inside it and should be solid clear across the flat span.
+        let half_span = (HEX_HALF_W * (1.0 - HEX_CUT)) as u32;
+        for x in (SIZE / 2 - half_span + 2)..(SIZE / 2 + half_span - 2) {
+            assert!(
+                alpha_at(x, 3) > 200,
+                "top edge should be flat, but x={x} is not filled"
+            );
+        }
+    }
+
+    #[test]
     fn segment_thickness_leaves_room_for_a_middle_gap() {
         // The middle bar (G) sits between the upper and lower vertical
         // segments, each further inset by a small visual `gap`; if segment
@@ -562,7 +696,7 @@ mod tests {
         // legible digit shape. Mirrors the real layout math in
         // `draw_seven_segment_digit` exactly (including the gap inset),
         // not just an approximation of it.
-        for shape in [BadgeShape::Circle, BadgeShape::RoundedSquare] {
+        for shape in BadgeShape::ALL {
             for len in 1..=3usize {
                 let (w, h, _spacing) = digit_box_for_count(shape, len);
                 let t = (w / 4).max(5);
@@ -591,7 +725,7 @@ mod tests {
         let dir = std::env::temp_dir().join("claude-usage-widget-icon-previews");
         let _ = std::fs::create_dir_all(&dir);
 
-        let cases: [(&str, [u8; 3], u32, BadgeShape); 7] = [
+        let cases: [(&str, [u8; 3], u32, BadgeShape); 10] = [
             ("usage_amber_42", AMBER, 42, BadgeShape::Circle),
             ("usage_red_87", RED, 87, BadgeShape::Circle),
             ("usage_green_7", GREEN, 7, BadgeShape::Circle),
@@ -599,6 +733,9 @@ mod tests {
             ("usage_red_5", RED, 5, BadgeShape::Circle),
             ("temp_green_62", GREEN, 62, BadgeShape::RoundedSquare),
             ("temp_red_91", RED, 91, BadgeShape::RoundedSquare),
+            ("server_tps_47", GREEN, 47, BadgeShape::Hexagon),
+            ("server_running_3", GREEN, 3, BadgeShape::Hexagon),
+            ("server_kv_100", AMBER, 100, BadgeShape::Hexagon),
         ];
 
         for (name, color, pct, shape) in cases {

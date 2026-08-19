@@ -6,7 +6,13 @@
 // `api.anthropic.com/api/oauth/usage` endpoint that Claude Code's own
 // statusline uses, with the OAuth token Claude Code already cached locally.
 //
-// No telemetry and no network calls to anything other than api.anthropic.com.
+// Since 0.8.0 it can also watch local inference servers (vLLM and Ollama) and
+// give each metric its own tray icon -- see `servers/`. Those are the only
+// other hosts it ever contacts, they are whatever the user put in
+// `servers.json`, and there are none until that file says otherwise.
+//
+// No telemetry, and no network calls to anything other than api.anthropic.com
+// plus the servers configured by hand.
 // Locally it reads the credentials file, writes a diagnostic log under
 // `%LOCALAPPDATA%\ClaudeUsageWidget` (see `log.rs`), and touches
 // (optionally) the HKCU Run registry key for the "Start with Windows" toggle
@@ -19,9 +25,11 @@ mod log;
 mod notify;
 mod panel;
 mod registry;
+mod servers;
 mod single_instance;
 mod usage;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
@@ -35,6 +43,7 @@ use tray_icon::{TrayIconBuilder, TrayIconEvent};
 use windows_sys::Win32::Foundation::HWND;
 
 use panel::PanelMode;
+use servers::{Level, ServerSample};
 use usage::TrayState;
 
 // The poll interval is now a user-configurable, live-adjustable setting (see
@@ -101,6 +110,20 @@ enum UserEvent {
     /// Latest CPU temperature in whole degrees Celsius, or `None` when this
     /// machine exposes no usable thermal sensor / the sample failed.
     CpuTemp(Option<u32>),
+    /// One scrape of one configured inference server (see `servers`).
+    Server(Box<ServerSample>),
+}
+
+/// One user-configured inference-server tray icon.
+///
+/// `tray: None` is the hidden state rather than a separate flag -- dropping
+/// the `TrayIcon` is what removes it from the tray, so keeping a boolean
+/// beside it could only ever drift out of sync with what's on screen. Same
+/// pattern the CPU-temperature icon already uses, generalized to N icons.
+struct ServerIcon {
+    cfg: servers::TrayIconConfig,
+    item: CheckMenuItem,
+    tray: Option<tray_icon::TrayIcon>,
 }
 
 fn main() {
@@ -309,6 +332,25 @@ fn main() {
         Submenu::with_items("Poll interval", true, &poll_interval_submenu_entries)
             .expect("failed to build poll interval submenu");
 
+    // "Servers" submenu: a live status line per configured inference server,
+    // then one checkbox per configured tray icon, then the two things you
+    // need when editing the config -- open it, and reload it without
+    // restarting the widget.
+    let mut server_config = servers::load_config();
+    let servers_submenu = Submenu::new("Servers", true);
+    let server_edit_item = MenuItem::new("Edit servers.json...", true, None);
+    let server_reload_item = MenuItem::new("Reload servers.json", true, None);
+    let mut server_status_items: Vec<(String, MenuItem)> = Vec::new();
+    let mut server_icons: Vec<ServerIcon> = Vec::new();
+    populate_servers_submenu(
+        &servers_submenu,
+        &server_config,
+        &mut server_status_items,
+        &mut server_icons,
+        &server_edit_item,
+        &server_reload_item,
+    );
+
     let quit_item = MenuItem::new("Quit", true, None);
 
     let tray_menu = Menu::new();
@@ -321,10 +363,23 @@ fn main() {
         &startup_item,
         &cpu_temp_item,
         &panel_submenu,
+        &servers_submenu,
         &poll_interval_submenu,
         &PredefinedMenuItem::separator(),
         &quit_item,
     ]);
+
+    // The server worker is started after the menu exists so the first
+    // samples have somewhere to land.
+    let server_proxy = event_loop.create_proxy();
+    let server_tx = servers::spawn_worker(server_config.enabled_servers(), move |sample| {
+        let _ = server_proxy.send_event(UserEvent::Server(Box::new(sample)));
+    });
+
+    // Latest sample per server name, so an icon toggled back on (or a config
+    // reload) can render the current reading immediately instead of sitting
+    // gray until the next scrape.
+    let mut server_samples: HashMap<String, ServerSample> = HashMap::new();
 
     let mut tray_icon: Option<tray_icon::TrayIcon> = None;
     // Present only while the CPU-temperature icon is enabled: dropping the
@@ -364,6 +419,13 @@ fn main() {
                     temp_tray = build_temp_tray(&tray_menu, last_temp_c);
                 }
 
+                for server_icon in server_icons.iter_mut() {
+                    if server_icon.cfg.visible {
+                        server_icon.tray =
+                            build_server_tray(&tray_menu, &server_icon.cfg, None);
+                    }
+                }
+
                 // Best-effort: pin our icon(s) to "always show" instead of
                 // leaving them behind the overflow chevron. Runs on its own
                 // thread with retries since Windows registers the
@@ -371,7 +433,14 @@ fn main() {
                 // startup and never panics on failure. The count matters --
                 // Windows keeps one entry per icon, and promoting only the
                 // first would leave the temperature icon hidden.
-                registry::promote_tray_icon_async(if cpu_temp_visible_initial { 2 } else { 1 });
+                // NotifyIconSettings keeps one subkey per ICON, not per app,
+                // so the count has to include every icon this process
+                // registers -- promoting only the first would leave the rest
+                // stuck behind the overflow chevron.
+                registry::promote_tray_icon_async(tray_icon_count(
+                    cpu_temp_visible_initial,
+                    &server_icons,
+                ));
 
                 // Create the (initially hidden, unless persisted otherwise)
                 // floating usage panel window. Created once here and only
@@ -447,9 +516,114 @@ fn main() {
                 }
             }
 
+            Event::UserEvent(UserEvent::Server(sample)) => {
+                let sample = *sample;
+
+                if let Some((_, item)) = server_status_items
+                    .iter()
+                    .find(|(name, _)| *name == sample.server)
+                {
+                    item.set_text(sample.menu_line());
+                }
+
+                for server_icon in server_icons.iter_mut() {
+                    if server_icon.cfg.server != sample.server {
+                        continue;
+                    }
+                    if let Some(tray) = server_icon.tray.as_ref() {
+                        apply_server_icon(tray, &server_icon.cfg, Some(&sample));
+                    }
+                }
+
+                server_samples.insert(sample.server.clone(), sample);
+            }
+
             Event::UserEvent(UserEvent::Menu(event)) => {
                 if event.id == refresh_item.id() {
                     let _ = refresh_tx.send(());
+                    let _ = server_tx.send(servers::WorkerCommand::RefreshNow);
+                } else if event.id == server_edit_item.id() {
+                    match servers::config_path() {
+                        Some(path) => {
+                            // Ensure the file exists before handing it to the
+                            // shell: opening a path that isn't there just
+                            // produces a confusing error dialog.
+                            if !path.exists() {
+                                let _ = servers::write_config(&server_config);
+                            }
+                            open_in_shell(&path);
+                        }
+                        None => eprintln!("[claude-usage-widget] no %LOCALAPPDATA% to open"),
+                    }
+                } else if event.id == server_reload_item.id() {
+                    server_config = servers::load_config();
+                    let _ = server_tx.send(servers::WorkerCommand::Reconfigure(
+                        server_config.enabled_servers(),
+                    ));
+
+                    // Rebuild both the submenu and the icons: a reload can
+                    // add, remove or re-point any of them.
+                    for server_icon in server_icons.iter_mut() {
+                        server_icon.tray.take();
+                    }
+                    // Emptied wholesale rather than item by item: the edit
+                    // and reload entries are re-appended by
+                    // `populate_servers_submenu`, so removing everything is
+                    // both simpler and immune to a partial rebuild leaving
+                    // stale lines behind.
+                    while !servers_submenu.items().is_empty() {
+                        servers_submenu.remove_at(0);
+                    }
+                    server_status_items.clear();
+                    server_icons.clear();
+                    populate_servers_submenu(
+                        &servers_submenu,
+                        &server_config,
+                        &mut server_status_items,
+                        &mut server_icons,
+                        &server_edit_item,
+                        &server_reload_item,
+                    );
+                    server_samples.clear();
+                    for server_icon in server_icons.iter_mut() {
+                        if server_icon.cfg.visible {
+                            server_icon.tray =
+                                build_server_tray(&tray_menu, &server_icon.cfg, None);
+                        }
+                    }
+                    registry::promote_tray_icon_async(tray_icon_count(
+                        cpu_temp_item.is_checked(),
+                        &server_icons,
+                    ));
+                } else if let Some(index) = server_icons
+                    .iter()
+                    .position(|server_icon| event.id == server_icon.item.id())
+                {
+                    // muda has already flipped the checkmark; make the tray
+                    // and the config file agree with it.
+                    let desired = server_icons[index].item.is_checked();
+                    server_icons[index].cfg.visible = desired;
+                    if desired {
+                        let sample = server_samples.get(&server_icons[index].cfg.server);
+                        server_icons[index].tray =
+                            build_server_tray(&tray_menu, &server_icons[index].cfg, sample);
+                        registry::promote_tray_icon_async(tray_icon_count(
+                            cpu_temp_item.is_checked(),
+                            &server_icons,
+                        ));
+                    } else {
+                        server_icons[index].tray.take();
+                    }
+                    // Persist, so the choice survives a restart the same way
+                    // every other visibility toggle does. `server_icons` is
+                    // built from `server_config.tray_icons` in order, so the
+                    // index is the same in both.
+                    if let Some(cfg) = server_config.tray_icons.get_mut(index) {
+                        cfg.visible = desired;
+                    }
+                    if let Err(e) = servers::write_config(&server_config) {
+                        eprintln!("[claude-usage-widget] could not save servers.json: {e}");
+                    }
                 } else if event.id == startup_item.id() {
                     // muda already toggled the visual checked state before
                     // delivering this event; make the registry match it.
@@ -475,7 +649,7 @@ fn main() {
                         // Only worth re-running when an icon was just added;
                         // the entry for a newly registered icon won't exist
                         // until Windows gets around to writing it.
-                        registry::promote_tray_icon_async(2);
+                        registry::promote_tray_icon_async(tray_icon_count(true, &server_icons));
                     } else {
                         // Dropping the TrayIcon is what removes it from the
                         // tray -- there's no explicit hide call.
@@ -509,6 +683,10 @@ fn main() {
                 } else if event.id == quit_item.id() {
                     tray_icon.take();
                     temp_tray.take();
+                    for server_icon in server_icons.iter_mut() {
+                        server_icon.tray.take();
+                    }
+                    let _ = server_tx.send(servers::WorkerCommand::Shutdown);
                     *control_flow = ControlFlow::Exit;
                 } else {
                     eprintln!("[claude-usage-widget] menu: unmatched event id {:?}", event.id);
@@ -518,6 +696,156 @@ fn main() {
             _ => {}
         }
     });
+}
+
+/// Fills the "Servers" submenu: one (disabled) status line per configured
+/// server, one checkbox per configured tray icon, then the edit/reload pair.
+///
+/// Also creates the `ServerIcon` records, in the same order as
+/// `config.tray_icons`, so a toggle can map an index straight back onto the
+/// config it has to persist.
+fn populate_servers_submenu(
+    submenu: &Submenu,
+    config: &servers::Config,
+    status_items: &mut Vec<(String, MenuItem)>,
+    icons: &mut Vec<ServerIcon>,
+    edit_item: &MenuItem,
+    reload_item: &MenuItem,
+) {
+    if config.servers.is_empty() {
+        let hint = MenuItem::new("No servers configured", false, None);
+        let _ = submenu.append(&hint);
+    }
+
+    for server in &config.servers {
+        let text = if server.enabled {
+            format!("{}  connecting...", server.name)
+        } else {
+            format!("{}  disabled", server.name)
+        };
+        // Disabled on purpose: these are readouts, not actions. Same
+        // treatment the session/weekly usage lines get in the main menu.
+        let item = MenuItem::new(text, false, None);
+        let _ = submenu.append(&item);
+        status_items.push((server.name.clone(), item));
+    }
+
+    if !config.tray_icons.is_empty() {
+        let _ = submenu.append(&PredefinedMenuItem::separator());
+    }
+    for cfg in &config.tray_icons {
+        let label = cfg
+            .label
+            .clone()
+            .or_else(|| servers::metric_def(&cfg.metric).map(|d| d.label.to_string()))
+            .unwrap_or_else(|| cfg.metric.clone());
+        let item = CheckMenuItem::new(
+            format!("Show {} {}", cfg.server, label),
+            true,
+            cfg.visible,
+            None,
+        );
+        let _ = submenu.append(&item);
+        icons.push(ServerIcon {
+            cfg: cfg.clone(),
+            item,
+            tray: None,
+        });
+    }
+
+    let _ = submenu.append(&PredefinedMenuItem::separator());
+    let _ = submenu.append(edit_item);
+    let _ = submenu.append(reload_item);
+}
+
+/// How many tray icons this process currently registers. Windows keeps one
+/// `NotifyIconSettings` subkey per icon, so "promote mine out of the overflow
+/// area" needs the real count, not just "1 or 2".
+fn tray_icon_count(cpu_temp_visible: bool, icons: &[ServerIcon]) -> usize {
+    1 + usize::from(cpu_temp_visible) + icons.iter().filter(|i| i.tray.is_some() || i.cfg.visible).count()
+}
+
+/// Builds one server-metric tray icon, sharing the main tray menu (so a
+/// right-click on any icon opens the same menu -- without that, hiding an
+/// icon would be a one-way trip unless the user knew to right-click a
+/// different one).
+fn build_server_tray(
+    menu: &Menu,
+    cfg: &servers::TrayIconConfig,
+    sample: Option<&ServerSample>,
+) -> Option<tray_icon::TrayIcon> {
+    let display = servers::display_for(cfg, sample);
+    let built = TrayIconBuilder::new()
+        .with_icon(server_icon_image(cfg, &display))
+        .with_tooltip(display.tooltip)
+        .with_menu(Box::new(menu.clone()))
+        .build();
+
+    match built {
+        Ok(tray) => Some(tray),
+        Err(e) => {
+            eprintln!(
+                "[claude-usage-widget] failed to create the {} {} tray icon: {e}",
+                cfg.server, cfg.metric
+            );
+            None
+        }
+    }
+}
+
+fn apply_server_icon(
+    tray: &tray_icon::TrayIcon,
+    cfg: &servers::TrayIconConfig,
+    sample: Option<&ServerSample>,
+) {
+    let display = servers::display_for(cfg, sample);
+    let _ = tray.set_icon(Some(server_icon_image(cfg, &display)));
+    let _ = tray.set_tooltip(Some(display.tooltip));
+}
+
+/// The badge itself: the metric's number over a status colour, or -- when the
+/// server is unreachable or the metric is missing -- a plain gray digitless
+/// badge, matching how both existing icons signal "no data" rather than
+/// inventing a third idea of what missing data looks like.
+fn server_icon_image(
+    cfg: &servers::TrayIconConfig,
+    display: &servers::MetricDisplay,
+) -> tray_icon::Icon {
+    let color = match display.level {
+        Level::Ok => icon::GREEN,
+        Level::Warn => icon::AMBER,
+        Level::Crit => icon::RED,
+        Level::Unavailable => icon::GRAY,
+    };
+    icon::render(color, display.badge, badge_shape(cfg.shape))
+}
+
+fn badge_shape(shape: servers::IconShape) -> icon::BadgeShape {
+    match shape {
+        servers::IconShape::Circle => icon::BadgeShape::Circle,
+        servers::IconShape::Square => icon::BadgeShape::RoundedSquare,
+        servers::IconShape::Hex => icon::BadgeShape::Hexagon,
+    }
+}
+
+/// Opens a path with whatever the shell has associated with it (Notepad, for
+/// a .json file, on a default Windows install).
+///
+/// `cmd /c start` rather than `ShellExecuteW`: it needs no new windows-sys
+/// feature and no COM initialization on this thread, and the failure mode of
+/// a mistyped path is a window that doesn't open rather than a crash.
+/// `CREATE_NO_WINDOW` keeps the console flash away.
+fn open_in_shell(path: &std::path::Path) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let result = std::process::Command::new("cmd")
+        .args(["/c", "start", "", &path.to_string_lossy()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+    if let Err(e) = result {
+        eprintln!("[claude-usage-widget] could not open {}: {e}", path.display());
+    }
 }
 
 /// Builds the CPU-temperature tray icon, sharing the main tray menu so a
