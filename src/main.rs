@@ -11,8 +11,12 @@
 // other hosts it ever contacts, they are whatever the user put in
 // `servers.json`, and there are none until that file says otherwise.
 //
+// Since 0.9.0 "Open pixel office" starts pixel-agents (via `npx`, so npm's
+// registry is contacted the first time) and shows every Claude Code session
+// as a pixel-art character in the browser -- see `office.rs`. Only on click.
+//
 // No telemetry, and no network calls to anything other than api.anthropic.com
-// plus the servers configured by hand.
+// plus the servers configured by hand (and npm, for the pixel office).
 // Locally it reads the credentials file, writes a diagnostic log under
 // `%LOCALAPPDATA%\ClaudeUsageWidget` (see `log.rs`), and touches
 // (optionally) the HKCU Run registry key for the "Start with Windows" toggle
@@ -23,6 +27,7 @@ mod cpu_temp;
 mod icon;
 mod log;
 mod notify;
+mod office;
 mod panel;
 mod registry;
 mod servers;
@@ -215,6 +220,9 @@ fn main() {
     let extra_item = MenuItem::new("Extra usage  loading...", false, None);
     let mut extra_item_shown = false;
     let refresh_item = MenuItem::new("Refresh now", true, None);
+    // Every Claude Code session as a pixel-art character in the browser -- see `office.rs`.
+    let office = office::Office::default();
+    let office_item = MenuItem::new("Open pixel office", true, None);
     let startup_item = CheckMenuItem::new(
         "Start with Windows",
         true,
@@ -360,6 +368,7 @@ fn main() {
         &projected_item,
         &PredefinedMenuItem::separator(),
         &refresh_item,
+        &office_item,
         &startup_item,
         &cpu_temp_item,
         &panel_submenu,
@@ -680,7 +689,10 @@ fn main() {
                     .find(|(item, _)| event.id == item.id())
                 {
                     select_poll_interval(&poll_interval_items, &poll_interval_secs, *secs);
+                } else if event.id == office_item.id() {
+                    office.open();
                 } else if event.id == quit_item.id() {
+                    office.stop();
                     tray_icon.take();
                     temp_tray.take();
                     for server_icon in server_icons.iter_mut() {

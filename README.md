@@ -212,6 +212,28 @@ a laptop could pull tens of gigabytes into a remote box's VRAM (evicting
 whatever was there) purely as a side effect of being open. Note that probing
 does reset that model's keep-alive timer.
 
+### Pixel office
+
+**Open pixel office** in the tray menu shows every Claude Code session on this
+machine as a pixel-art character in a little office, in your browser: it sits
+at a desk and types or reads while the session works, raises a flag when a
+tool waits for your approval, and shows a check mark when it is done.
+
+The office is [pixel-agents](https://github.com/pixel-agents-hq/pixel-agents)
+(MIT), version 1.4.1, which the widget starts on the first click with
+`npx pixel-agents@1.4.1 --port 47615` from your home folder and stops when you
+quit the widget. It needs **Node.js 20+** on PATH; the first start downloads
+the package, so it takes a few seconds. A server already answering on port
+47615 is reused rather than started twice.
+
+Out of the box pixel-agents follows sessions by reading their transcripts
+under `%USERPROFILE%\.claude\projects`. Two settings in the office's own
+**Settings** are worth knowing: *Watch all sessions* shows sessions from every
+project, not just the ones started in your home folder, and *hooks* (asked for
+on first open) installs Claude Code hooks into `~/.claude/settings.json` for
+faster, more precise updates. That is pixel-agents' own change, made only if
+you approve it there, and undone from the same place.
+
 ### Tooltip
 
 Hovering the icon shows a three-line summary - the live session and weekly
@@ -399,7 +421,10 @@ already-cached token**, and to **whatever inference servers you list yourself
 in `servers.json`** (see [Inference server icons](#inference-server-icons-vllm--ollama)) -
 nothing else, no analytics, no telemetry, no third-party service. Out of the
 box that list is empty and disabled, so a fresh install talks only to
-Anthropic.
+Anthropic. The one exception you trigger yourself: **Open pixel office** runs
+`npx pixel-agents@1.4.1`, which fetches that package from the npm registry the
+first time and then serves the office on `127.0.0.1:47615` only (see
+[Pixel office](#pixel-office)).
 
 It reads exactly one local file: your existing Claude Code credentials cache
 at `%USERPROFILE%\.claude\.credentials.json`.

@@ -1,0 +1,31 @@
+name: CI
+
+# Every branch push and PR: tests, a release build, and the exe as a
+# downloadable artifact (Actions -> the run -> Artifacts). Releases themselves
+# still come only from a v* tag (release.yml).
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claude-usage-widget
+          path: target/release/claude-usage-widget.exe
